@@ -9,13 +9,23 @@
 <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@300;400;500;600;700;800;900&family=Tajawal:wght@300;400;500;700;800&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
-<!-- ══ FIREBASE v10 MODULAR SDK ══ -->
+<!-- ══ FIREBASE v10 MODULAR SDK — FIXED & PRODUCTION-READY ══ -->
 <script type="module">
-  import { initializeApp }               from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-  import { getFirestore, doc, getDoc, setDoc, onSnapshot, serverTimestamp }
-                                          from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+  import { initializeApp }
+    from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+  import {
+    getFirestore,
+    doc, getDoc, setDoc,
+    onSnapshot,
+    serverTimestamp,
+    enableIndexedDbPersistence
+  } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
-  /* ── Config ── */
+  /* ════════════════════════════════════════
+     ██  FIREBASE CONFIG — CHANGE HERE ONLY
+     Replace ALL 6 values from your Firebase
+     console → Project Settings → Your apps
+  ════════════════════════════════════════ */
   const firebaseConfig = {
     apiKey:            "AIzaSyDibmm6mF6_bq88ZI_msbOEAzEQXFgfpdQ",
     authDomain:        "nour-cb08f.firebaseapp.com",
@@ -24,81 +34,50 @@
     messagingSenderId: "782272735414",
     appId:             "1:782272735414:web:af90a6b5612ad8867dde17"
   };
+  /* ════════════════════════════════════════ */
 
   /* ── Init ── */
   const app = initializeApp(firebaseConfig);
+  const db  = getFirestore(app);
   console.log("✅ Firebase initialized — project:", firebaseConfig.projectId);
 
-  const db = getFirestore(app);
-  console.log("✅ Firestore connected");
+  /* ── FIX 1: Enable offline IndexedDB persistence ──
+       Saves data to the browser's local cache so the page
+       loads instantly on every refresh from every device,
+       even before the network responds. */
+  enableIndexedDbPersistence(db).catch(err => {
+    if (err.code === "failed-precondition") {
+      console.warn("⚠️ Persistence limited: multiple tabs open. Sync still works.");
+    } else if (err.code === "unimplemented") {
+      console.warn("⚠️ This browser does not support offline persistence.");
+    }
+  });
 
   /* ── Document reference: collection "app" / document "main" ── */
   const DOC_REF = doc(db, "app", "main");
 
-  /* ── Expose updateData globally so the rest of the page can call it ── */
+  /* ── Expose updateData globally so saveData() can call it ── */
   window.updateData = async function(newData) {
     try {
       await setDoc(DOC_REF, { ...newData, _updatedAt: serverTimestamp() }, { merge: true });
-      console.log("💾 Data updated in Firestore:", new Date().toLocaleTimeString());
+      console.log("💾 Firestore write OK:", new Date().toLocaleTimeString());
     } catch (err) {
       console.error("❌ Firestore write failed:", err);
+      throw err; // re-throw so saveData() .catch() shows the ❌ button
     }
   };
 
-  /* ── Bootstrap: read → create defaults if missing → start real-time listener ── */
-  async function bootstrap() {
-    try {
-      const snap = await getDoc(DOC_REF);
-
-      if (!snap.exists()) {
-        /* First run — push the local clientData defaults */
-        console.log("📄 No Firestore document found — creating default data…");
-        await window.updateData(window.clientData || {});
-        console.log("✅ Default data written to Firestore");
-      } else {
-        /* Hydrate local state from Firestore */
-        const remote = snap.data();
-        console.log("📥 Data loaded from Firestore:", Object.keys(remote).join(", "));
-        window._hydrateClientData(remote);
-        /* ── Trigger initial render after hydration ── */
-        if (typeof window.renderAll === "function") window.renderAll();
-        if (typeof window.updateProgressDisplay === "function") window.updateProgressDisplay();
-      }
-
-      /* ── Real-time sync ── */
-      onSnapshot(DOC_REF, (snapshot) => {
-        if (!snapshot.exists()) return;
-        const remote = snapshot.data();
-        console.log("🔄 Real-time update received:", new Date().toLocaleTimeString());
-        window._hydrateClientData(remote);
-        /* Re-render only when NOT in coach-edit mode to avoid disrupting active edits */
-        if (typeof window.coachMode !== "undefined" && !window.coachMode) {
-          if (typeof window.renderAll === "function") window.renderAll();
-          if (typeof window.updateProgressDisplay === "function") window.updateProgressDisplay();
-        }
-      }, (err) => {
-        console.error("❌ onSnapshot error:", err);
-      });
-
-      console.log("📡 Real-time sync is WORKING");
-
-    } catch (err) {
-      console.error("❌ Firebase bootstrap error:", err);
-    }
-  }
-
-  /* ── Safe hydration: merge only keys that exist in clientData ── */
+  /* ── FIX 2: Safe hydration — includes "name" key (was missing before) ── */
   window._hydrateClientData = function(remote) {
     if (!window.clientData || !remote) return;
     const safeKeys = [
-      "sub","overview","weeklyPlan","checkin",
-      "nutrition","meals","guide","supplements","workouts",
-      "cardioTime","progress","whyStart"
+      "name", "sub", "overview", "weeklyPlan", "checkin",
+      "nutrition", "meals", "guide", "supplements", "workouts",
+      "cardioTime", "progress", "whyStart"
     ];
     safeKeys.forEach(key => {
       if (remote[key] !== undefined && remote[key] !== null) {
         try {
-          /* Deep-clone to avoid Firestore proxy objects */
           window.clientData[key] = JSON.parse(JSON.stringify(remote[key]));
         } catch(e) {
           window.clientData[key] = remote[key];
@@ -107,22 +86,61 @@
     });
   };
 
-  /* ── Wait for the DOM + clientData to be ready, then bootstrap ── */
-  function waitForClientData(attempts) {
-    if (window.clientData) {
+  /* ── Bootstrap: load Firestore → hydrate → render → start real-time sync ── */
+  async function bootstrap() {
+    try {
+      const snap = await getDoc(DOC_REF);
+
+      if (!snap.exists()) {
+        console.log("📄 No Firestore document found — writing default clientData…");
+        await window.updateData(window.clientData || {});
+        console.log("✅ Default data written to Firestore on first run");
+      } else {
+        const remote = snap.data();
+        console.log("📥 Data loaded from Firestore:", Object.keys(remote).join(", "));
+        window._hydrateClientData(remote);
+        if (typeof window.renderAll             === "function") window.renderAll();
+        if (typeof window.updateProgressDisplay === "function") window.updateProgressDisplay();
+      }
+
+      /* ── Real-time listener: updates all open tabs/devices instantly ── */
+      onSnapshot(DOC_REF, snapshot => {
+        if (!snapshot.exists()) return;
+        console.log("🔄 Real-time update received:", new Date().toLocaleTimeString());
+        window._hydrateClientData(snapshot.data());
+        /* Only re-render when NOT in active coach edit mode */
+        if (typeof window.coachMode !== "undefined" && !window.coachMode) {
+          if (typeof window.renderAll             === "function") window.renderAll();
+          if (typeof window.updateProgressDisplay === "function") window.updateProgressDisplay();
+        }
+      }, err => console.error("❌ onSnapshot error:", err));
+
+      console.log("📡 Real-time sync is ACTIVE ✓");
+
+    } catch (err) {
+      console.error("❌ Firebase bootstrap error:", err);
+    }
+  }
+
+  /* ── FIX 3: Wait for BOTH clientData AND renderAll to be ready ──
+       The old code only checked clientData, missing the race condition
+       where renderAll (defined in the classic <script> below) wasn't
+       available yet. Now polls up to 50 × 100ms = 5 seconds. ── */
+  function waitAndBootstrap(attempts) {
+    if (window.clientData && typeof window.renderAll === "function") {
       bootstrap();
     } else if (attempts > 0) {
-      setTimeout(() => waitForClientData(attempts - 1), 100);
+      setTimeout(() => waitAndBootstrap(attempts - 1), 100);
     } else {
-      console.warn("⚠️ clientData not found after waiting — running bootstrap without it");
+      console.warn("⚠️ Timed out waiting — bootstrapping anyway");
       bootstrap();
     }
   }
 
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", () => waitForClientData(30));
+    document.addEventListener("DOMContentLoaded", () => waitAndBootstrap(50));
   } else {
-    waitForClientData(30);
+    waitAndBootstrap(50);
   }
 </script>
 <!-- ══ END FIREBASE ══ -->
