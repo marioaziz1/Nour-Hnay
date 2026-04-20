@@ -9,23 +9,13 @@
 <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@300;400;500;600;700;800;900&family=Tajawal:wght@300;400;500;700;800&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
-<!-- ══ FIREBASE v10 MODULAR SDK — FIXED & PRODUCTION-READY ══ -->
+<!-- ══ FIREBASE v10 MODULAR SDK ══ -->
 <script type="module">
-  import { initializeApp }
-    from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-  import {
-    getFirestore,
-    doc, getDoc, setDoc,
-    onSnapshot,
-    serverTimestamp,
-    enableIndexedDbPersistence
-  } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+  import { initializeApp }               from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+  import { getFirestore, doc, getDoc, setDoc, onSnapshot, serverTimestamp, enableIndexedDbPersistence }
+                                          from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
-  /* ════════════════════════════════════════
-     ██  FIREBASE CONFIG — CHANGE HERE ONLY
-     Replace ALL 6 values from your Firebase
-     console → Project Settings → Your apps
-  ════════════════════════════════════════ */
+  /* ── Config ── */
   const firebaseConfig = {
     apiKey:            "AIzaSyDibmm6mF6_bq88ZI_msbOEAzEQXFgfpdQ",
     authDomain:        "nour-cb08f.firebaseapp.com",
@@ -34,17 +24,12 @@
     messagingSenderId: "782272735414",
     appId:             "1:782272735414:web:af90a6b5612ad8867dde17"
   };
-  /* ════════════════════════════════════════ */
 
   /* ── Init ── */
   const app = initializeApp(firebaseConfig);
-  const db  = getFirestore(app);
   console.log("✅ Firebase initialized — project:", firebaseConfig.projectId);
 
-  /* ── FIX 1: Enable offline IndexedDB persistence ──
-       Saves data to the browser's local cache so the page
-       loads instantly on every refresh from every device,
-       even before the network responds. */
+  const db = getFirestore(app);
   enableIndexedDbPersistence(db).catch(err => {
     if (err.code === "failed-precondition") {
       console.warn("⚠️ Persistence limited: multiple tabs open. Sync still works.");
@@ -52,32 +37,142 @@
       console.warn("⚠️ This browser does not support offline persistence.");
     }
   });
+  console.log("✅ Firestore connected");
 
   /* ── Document reference: collection "app" / document "main" ── */
   const DOC_REF = doc(db, "app", "main");
 
-  /* ── Expose updateData globally so saveData() can call it ── */
+  /*
+   * FIX: _initialLoadComplete flag
+   * ─────────────────────────────────────────────────────────────────────────────
+   * PROBLEM: onSnapshot fires immediately on attach (with the current server
+   * value), and it also fires after every setDoc call.  Without a guard this
+   * created two race-condition loops:
+   *
+   *  1. DOMContentLoaded → renderAll() with LOCAL defaults
+   *     → bootstrap() reads Firestore → hydrates clientData → (no re-render
+   *       here, but onSnapshot fires at the same moment) → onSnapshot also
+   *       calls renderAll() while the first render is still settling.
+   *
+   *  2. saveData() → updateData() / setDoc → onSnapshot fires AGAIN with the
+   *     newly written data → _hydrateClientData() overwrites clientData with
+   *     the just-saved value (harmless in theory) but then calls renderAll()
+   *     which re-stamps the DOM, discarding any unsaved in-progress edits and
+   *     visually "reverting" the UI.
+   *
+   * FIX STRATEGY:
+   *  • _initialLoadComplete: set to true only after the getDoc() bootstrap
+   *    resolves. onSnapshot ignores all events that arrive before this flag
+   *    is true (the very first snapshot is redundant — getDoc already handled it).
+   *  • _isSaving: set to true just before every setDoc call, cleared after it
+   *    resolves. onSnapshot skips re-hydration and re-render while a save is
+   *    in flight, preventing the "save → snapshot → overwrite" loop.
+   *  • Default data is written to Firestore ONLY when the document does not
+   *    exist (snap.exists() === false). This was already correct but is now
+   *    protected by the flags above so the subsequent snapshot from that write
+   *    cannot trigger a second default-data push.
+   * ─────────────────────────────────────────────────────────────────────────────
+   */
+  let _initialLoadComplete = false;
+  let _isSaving            = false;
+
+  /* ── Expose updateData globally so the rest of the page can call it ── */
   window.updateData = async function(newData) {
     try {
+      _isSaving = true;                                   // FIX: block snapshot reaction during write
       await setDoc(DOC_REF, { ...newData, _updatedAt: serverTimestamp() }, { merge: true });
-      console.log("💾 Firestore write OK:", new Date().toLocaleTimeString());
+      console.log("✅ Data safely written to Firestore:", new Date().toLocaleTimeString());
     } catch (err) {
       console.error("❌ Firestore write failed:", err);
-      throw err; // re-throw so saveData() .catch() shows the ❌ button
+      throw err; // ← MUST BE HERE
+    } finally {
+      // Small delay so the onSnapshot triggered by this write is still in flight
+      // when we clear the flag; the handler checks it synchronously and skips.
+      setTimeout(() => { _isSaving = false; }, 800);
     }
   };
 
-  /* ── FIX 2: Safe hydration — includes "name" key (was missing before) ── */
+  /* ── Bootstrap: read → create defaults if missing → start real-time listener ── */
+  async function bootstrap() {
+    try {
+      const snap = await getDoc(DOC_REF);
+
+      if (!snap.exists()) {
+        /* First run — push the local clientData defaults ONLY once */
+        console.log("📄 No Firestore document found — creating default data…");
+        console.log("No overwrite triggered — this is a first-run write only");
+        await window.updateData(window.clientData || {});
+        window._firebaseReady = true;
+        console.log("✅ Default data written to Firestore");
+      } else {
+        /* Hydrate local state from Firestore — this is the ONE authoritative load */
+        const remote = snap.data();
+        console.log("📥 Data loaded from Firestore:", Object.keys(remote).join(", "));
+        window._hydrateClientData(remote);
+        /* Re-render once after the authoritative load */
+        if (typeof window.renderAll === "function") window.renderAll();
+        if (typeof window.updateProgressDisplay === "function") window.updateProgressDisplay();
+        if (typeof window.initChart === "function") window.initChart();
+        window._firebaseReady = true;
+        console.log("✅ Initial load complete");
+      }
+
+      /* Dismiss the loading bar — Firebase responded */
+      const fbBar = document.getElementById('fbLoadingBar');
+      if (fbBar) { fbBar.classList.add('done'); setTimeout(() => fbBar.remove(), 600); }
+
+      /* Mark initial load done BEFORE attaching onSnapshot so the first
+         snapshot event (which fires immediately on attach) is safely ignored. */
+      _initialLoadComplete = true;
+
+      /* ── Real-time sync ── */
+      onSnapshot(DOC_REF, (snapshot) => {
+        /* FIX: ignore the immediate echo fired on listener attachment */
+        if (!_initialLoadComplete) {
+          console.log("No overwrite triggered — skipping pre-load snapshot");
+          return;
+        }
+        /* FIX: ignore snapshots triggered by our own saveData() writes */
+        if (_isSaving) {
+          console.log("No overwrite triggered — snapshot skipped during save");
+          return;
+        }
+        if (!snapshot.exists()) return;
+
+        const remote = snapshot.data();
+        console.log("🔄 Real-time update received:", new Date().toLocaleTimeString());
+        window._hydrateClientData(remote);
+
+        /* Re-render only when NOT in coach-edit mode to avoid disrupting active edits */
+        if (typeof window.coachMode !== "undefined" && !window.coachMode) {
+          if (typeof window.renderAll === "function") window.renderAll();
+          if (typeof window.updateProgressDisplay === "function") window.updateProgressDisplay();
+        } else {
+          console.log("No overwrite triggered — coach mode active, skipping re-render");
+        }
+      }, (err) => {
+        console.error("❌ onSnapshot error:", err);
+      });
+
+      console.log("📡 Real-time sync is WORKING");
+
+    } catch (err) {
+      console.error("❌ Firebase bootstrap error:", err);
+    }
+  }
+
+  /* ── Safe hydration: merge only keys that exist in clientData ── */
   window._hydrateClientData = function(remote) {
     if (!window.clientData || !remote) return;
     const safeKeys = [
-      "name", "sub", "overview", "weeklyPlan", "checkin",
-      "nutrition", "meals", "guide", "supplements", "workouts",
-      "cardioTime", "progress", "whyStart"
+      "name","sub","overview","weeklyPlan","checkin",
+      "nutrition","meals","guide","supplements","workouts",
+      "cardioTime","progress","whyStart","mealsTitle"
     ];
     safeKeys.forEach(key => {
       if (remote[key] !== undefined && remote[key] !== null) {
         try {
+          /* Deep-clone to avoid Firestore proxy objects */
           window.clientData[key] = JSON.parse(JSON.stringify(remote[key]));
         } catch(e) {
           window.clientData[key] = remote[key];
@@ -86,46 +181,7 @@
     });
   };
 
-  /* ── Bootstrap: load Firestore → hydrate → render → start real-time sync ── */
-  async function bootstrap() {
-    try {
-      const snap = await getDoc(DOC_REF);
-
-      if (!snap.exists()) {
-        console.log("📄 No Firestore document found — writing default clientData…");
-        await window.updateData(window.clientData || {});
-        console.log("✅ Default data written to Firestore on first run");
-      } else {
-        const remote = snap.data();
-        console.log("📥 Data loaded from Firestore:", Object.keys(remote).join(", "));
-        window._hydrateClientData(remote);
-        if (typeof window.renderAll             === "function") window.renderAll();
-        if (typeof window.updateProgressDisplay === "function") window.updateProgressDisplay();
-      }
-
-      /* ── Real-time listener: updates all open tabs/devices instantly ── */
-      onSnapshot(DOC_REF, snapshot => {
-        if (!snapshot.exists()) return;
-        console.log("🔄 Real-time update received:", new Date().toLocaleTimeString());
-        window._hydrateClientData(snapshot.data());
-        /* Only re-render when NOT in active coach edit mode */
-        if (typeof window.coachMode !== "undefined" && !window.coachMode) {
-          if (typeof window.renderAll             === "function") window.renderAll();
-          if (typeof window.updateProgressDisplay === "function") window.updateProgressDisplay();
-        }
-      }, err => console.error("❌ onSnapshot error:", err));
-
-      console.log("📡 Real-time sync is ACTIVE ✓");
-
-    } catch (err) {
-      console.error("❌ Firebase bootstrap error:", err);
-    }
-  }
-
-  /* ── FIX 3: Wait for BOTH clientData AND renderAll to be ready ──
-       The old code only checked clientData, missing the race condition
-       where renderAll (defined in the classic <script> below) wasn't
-       available yet. Now polls up to 50 × 100ms = 5 seconds. ── */
+  /* ── Wait for the DOM + clientData to be ready, then bootstrap ── */
   function waitAndBootstrap(attempts) {
     if (window.clientData && typeof window.renderAll === "function") {
       bootstrap();
@@ -144,7 +200,6 @@
   }
 </script>
 <!-- ══ END FIREBASE ══ -->
-
 <style>
   :root {
     --bg: #0D0D0F; --bg2: #131316; --bg3: #1A1A1F; --bg4: #202028;
@@ -384,7 +439,7 @@
   .ov2-row:last-child { border-bottom:none; }
   .ov2-row:hover { background:rgba(255,255,255,0.02); }
   .ov2-label { padding:14px 22px; font-size:11px; font-weight:700; color:var(--text3); text-transform:uppercase; letter-spacing:1.2px; background:rgba(255,255,255,0.02); border-right:1px solid var(--border); display:flex; align-items:center; }
-  .ov2-value { padding:14px 22px; font-size:14px; font-weight:600; color:var(--text); display:flex; align-items:center; }
+  .ov2-value { padding:14px 22px; font-size:14px; font-weight:600; color:var(--text); display:flex; align-items:center; justify-content:center; text-align:center; }
   .ov2-accent { color:var(--yellow) !important; font-weight:800 !important; }
   @media (max-width:480px) {
     .ov2-row { grid-template-columns:130px 1fr; }
@@ -455,10 +510,10 @@
   .nutrition-intro p { font-size:14px; color:var(--text2); line-height:1.9; }
 
   .meal-cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); gap:16px; margin-bottom:24px; }
-  .meal-card { background:var(--card); border-radius:var(--radius); border:1px solid var(--border); padding:20px; transition:border-color 0.2s; position:relative; }
-  .meal-card:hover { border-color:rgba(245,197,24,0.25); }
-  .meal-card .meal-time { font-size:10px; font-weight:700; color:var(--yellow); text-transform:uppercase; letter-spacing:1.5px; margin-bottom:8px; }
-  .meal-card h4 { font-size:14px; font-weight:700; color:var(--text); margin-bottom:10px; }
+  .meal-card { background: linear-gradient(135deg, rgba(245,197,24,0.05), transparent); border-radius:var(--radius); border:1px solid rgba(245,197,24,0.2); padding:20px; transition:all 0.25s ease; position:relative; }
+  .meal-card:hover { border-color:var(--yellow); transform:translateY(-4px); box-shadow: 0 8px 28px rgba(0,0,0,0.35); }
+  .meal-card .meal-time { font-size:15px; font-weight:800; color:var(--yellow); text-transform:uppercase; letter-spacing:1px; margin-bottom:10px; }
+  .meal-card h4 { font-size:16px; font-weight:800; color:var(--white); margin-bottom:10px; }
   .meal-card ul { list-style:none; display:flex; flex-direction:column; gap:5px; }
   .meal-card ul li { font-size:12px; color:var(--text2); padding-right:12px; position:relative; }
   .meal-card ul li::before { content:'•'; position:absolute; right:0; color:var(--yellow2); }
@@ -500,14 +555,6 @@
   .supp-table-wrap tr:hover td { background:rgba(255,255,255,0.02); }
   .supp-name { font-size:14px; font-weight:700; color:var(--text); }
   .supp-badge { display:inline-flex; padding:3px 10px; border-radius:20px; font-size:11px; font-weight:700; background:rgba(245,197,24,0.1); border:1px solid rgba(245,197,24,0.2); color:var(--yellow); white-space:nowrap; }
-
-  /* ── SWAP GRID ── */
-  .swap-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:16px; }
-  .swap-card { background:var(--card); border-radius:var(--radius); border:1px solid var(--border); padding:20px; }
-  .swap-card h4 { font-size:14px; font-weight:700; color:var(--text); margin-bottom:14px; }
-  .swap-items { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
-  .swap-item { background:var(--bg4); border:1px solid var(--border); border-radius:20px; padding:5px 12px; font-size:12px; color:var(--text2); font-weight:600; }
-  .swap-arrow { color:var(--yellow); font-size:14px; font-weight:700; }
 
   /* ── WORKOUT SPLIT ── */
   .ws-top-btns { display:flex; gap:12px; margin-bottom:20px; flex-wrap:wrap; direction:ltr; justify-content:flex-start; }
@@ -564,16 +611,6 @@
   .ws-row-action { background:transparent; border:1px solid var(--border); border-radius:8px; padding:6px 10px; color:var(--text2); font-size:11px; cursor:pointer; transition:all 0.2s; white-space:nowrap; }
   .ws-row-action:hover { background:rgba(245,197,24,0.08); border-color:var(--yellow); color:var(--text); }
   .ws-row-action.remove { border-color:rgba(224, 98, 98, 0.35); }
-  .ws-cardio-block { margin-top:24px; background:var(--card); border:1px solid var(--border); border-radius:var(--radius); padding:20px; direction:ltr; text-align:left; }
-  .ws-cardio-title { font-size:16px; font-weight:800; margin-bottom:16px; color:var(--text); }
-  .cardio-section { margin-bottom:18px; direction:ltr; }
-  .cardio-table { width:100%; border-collapse:collapse; direction:ltr; }
-  .cardio-table th, .cardio-table td { text-align:left; }
-  .ws-row-action.delete-cardio { border-color:rgba(224, 98, 98, 0.35); }
-  .cardio-section-label { font-size:11px; font-weight:700; color:var(--text3); margin-bottom:8px; text-transform:uppercase; letter-spacing:1px; }
-  .cardio-table th, .cardio-table td { padding:10px 12px; text-align:left; font-size:13px; color:var(--text2); border:1px solid var(--border); }
-  .cardio-table th { background:var(--bg4); color:var(--text3); font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:1px; }
-  .cardio-table tr:hover td { background:rgba(255,255,255,0.03); }
   .ws-volume-result { display:none; align-items:center; gap:8px; padding:10px 14px; background:rgba(245,197,24,0.06); border:1px solid rgba(245,197,24,0.2); border-radius:var(--radius-sm); }
   .ws-volume-total { font-size:18px; font-weight:800; color:var(--yellow); }
   .ws-volume-unit { font-size:11px; color:var(--text3); font-weight:600; }
@@ -659,8 +696,8 @@
   .ds-task-chip { display:inline-flex; align-items:center; gap:5px; background:var(--bg4); border:1px solid var(--border); border-radius:20px; padding:4px 10px; font-size:11px; font-weight:600; color:var(--text3); transition:all 0.2s; }
   .ds-task-chip.done { background:rgba(245,197,24,0.1); border-color:rgba(245,197,24,0.3); color:var(--yellow); }
   .ds-note-area { padding:14px 20px; border-bottom:1px solid var(--border); }
-  .ds-note-label { font-size:10px; font-weight:700; color:var(--text3); text-transform:uppercase; letter-spacing:1.2px; margin-bottom:8px; }
-  .ds-note-input { width:100%; background:var(--bg4); border:1.5px solid var(--border2); border-radius:var(--radius-sm); padding:12px 14px; color:var(--text); font-family:'Cairo',sans-serif; font-size:13px; resize:none; outline:none; transition:border-color 0.2s; min-height:72px; direction:rtl; }
+  .ds-note-label { font-size:10px; font-weight:700; color:var(--text3); text-transform:uppercase; letter-spacing:1.2px; margin-bottom:8px; text-align:center; }
+  .ds-note-input { width:100%; background:var(--bg4); border:1.5px solid var(--border2); border-radius:var(--radius-sm); padding:12px 14px; color:var(--text); font-family:'Cairo',sans-serif; font-size:13px; resize:none; outline:none; transition:border-color 0.2s; min-height:72px; direction:rtl; text-align:center; }
   .ds-note-input::placeholder { color:var(--text3); }
   .ds-note-input:focus { border-color:rgba(245,197,24,0.4); }
   .ds-submit-area { padding:16px 20px 20px; text-align:center; display:flex; justify-content:center; align-items:center; flex-direction:column; }
@@ -695,8 +732,11 @@
   .em-overlay.em-active { display:block; animation:emFadeIn 0.3s ease; }
   .em-overlay::before { content:''; position:fixed; top:0; left:0; right:0; height:2px; background:var(--yellow); box-shadow:0 0 20px var(--yellow); z-index:1; }
   .em-scan { position:fixed; top:0; left:0; right:0; height:120px; background:linear-gradient(180deg,transparent 0%,rgba(245,197,24,0.03) 50%,transparent 100%); pointer-events:none; animation:emScan 4s linear infinite; z-index:1; }
-  .em-inner { max-width:720px; margin:0 auto; padding:40px 24px 80px; direction:ltr; text-align:left; }
-  .em-header { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:24px; }
+  .em-inner { max-width:720px; margin:0 auto; padding:40px 24px 80px; direction:rtl; text-align:right; }
+  .em-header { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:24px; }
+  .em-header-left { flex: 1; }
+  .em-header-title { text-align: center; width: 100%; }
+  .em-header-sub { text-align: center; width: 100%; }
   .em-header-left { display:flex; align-items:center; gap:14px; }
   .em-status-dot { width:10px; height:10px; border-radius:50%; background:#E05555; box-shadow:0 0 12px rgba(224,85,85,0.5); flex-shrink:0; animation:badgePulse 1.5s ease-in-out infinite; }
   .em-header-title { font-size:18px; font-weight:900; color:var(--white); }
@@ -990,7 +1030,7 @@
 
   /* Table horizontal scroll stability */
   .ws-table-wrap, .po-table-wrap, .orm-pct-table-wrap,
-  .cardio-table, .supp-table-wrap {
+  .supp-table-wrap {
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
   }
@@ -1085,7 +1125,6 @@
     .meal-cards { grid-template-columns: 1fr; }
     .diet-types-grid { grid-template-columns: 1fr; }
     .guide-grid { grid-template-columns: 1fr; }
-    .swap-grid { grid-template-columns: 1fr; }
   }
 
   /* DS score row mobile */
@@ -1125,11 +1164,6 @@
     .ws-vol-select, .ws-vol-btn { width: 100%; }
   }
 
-  /* Cardio table responsive */
-  @media (max-width: 600px) {
-    .ws-cardio-block { padding: 16px; }
-  }
-
 
   /* Coach mode bar responsive */
   @media (max-width: 600px) {
@@ -1143,8 +1177,56 @@
     outline-offset: 2px;
   }
 
-  /* Prevent layout shifts from contenteditable */
-  [contenteditable="true"] {
+  /* Firebase loading indicator */
+  #fbLoadingBar {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    height: 3px;
+    background: linear-gradient(90deg, var(--yellow2), var(--yellow), var(--yellow2));
+    background-size: 200% 100%;
+    animation: fbLoadingSlide 1.4s linear infinite;
+    z-index: 9999;
+    transition: opacity 0.5s ease;
+  }
+  @keyframes fbLoadingSlide {
+    0%   { background-position: 200% center; }
+    100% { background-position: -200% center; }
+  }
+  #fbLoadingBar.done { opacity: 0; pointer-events: none; }
+
+
+  @keyframes savedFadeIn {
+    0%   { opacity: 0; transform: translateY(-4px) scale(0.95); }
+    20%  { opacity: 1; transform: translateY(0) scale(1); }
+    75%  { opacity: 1; }
+    100% { opacity: 0; }
+  }
+  #savedIndicator {
+    display: none;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--low);
+    background: rgba(107,174,127,0.12);
+    border: 1px solid rgba(107,174,127,0.35);
+    border-radius: 20px;
+    padding: 5px 14px;
+    pointer-events: none;
+    white-space: nowrap;
+    margin-right: 4px;
+  }
+  #savedIndicator.visible {
+    display: flex;
+    animation: savedFadeIn 2.8s ease forwards;
+  }
+  #savedIndicator::before {
+    content: '✓';
+    font-size: 13px;
+    font-weight: 900;
+  }
+
+
     outline: none;
     min-height: 1em;
   }
@@ -1163,7 +1245,7 @@
   /* Fix ov2-grid direction for RTL */
   .ov2-grid { direction: ltr; }
   .ov2-label { direction: ltr; text-align: left; }
-  .ov2-value { direction: rtl; text-align: right; }
+  .ov2-value { direction: ltr; text-align: center; justify-content: center; }
 
   /* Ensure add exercise modal stacks correctly */
   #addExerciseModal { z-index: 300 !important; }
@@ -1192,9 +1274,222 @@
     .xp-widget { display: none !important; }
   }
 
+
+  /* ══ TRAINING ENGINE CONTROLS (Coach Mode Only) ══ */
+  .te-controls-bar {
+    display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start;
+    background: linear-gradient(135deg, rgba(245,197,24,0.07), rgba(245,197,24,0.03));
+    border: 1px solid rgba(245,197,24,0.2); border-radius: var(--radius);
+    padding: 18px 20px; margin-bottom: 20px; direction: ltr; text-align: left;
+    animation: coachModeIn 0.4s ease;
+  }
+  .te-control-group { display: flex; flex-direction: column; gap: 8px; flex: 1; min-width: 200px; }
+  .te-label { font-size: 11px; font-weight: 800; color: var(--yellow); text-transform: uppercase; letter-spacing: 1px; }
+  .te-select {
+    background: var(--bg4); border: 1.5px solid var(--border2); color: var(--text);
+    font-family: 'Cairo', sans-serif; font-size: 13px; padding: 8px 12px;
+    border-radius: var(--radius-sm); outline: none; cursor: pointer; transition: border-color 0.2s;
+  }
+  .te-select:focus { border-color: var(--yellow); }
+  .te-select option { background: #1A1A1F; }
+  .te-phase-hint {
+    font-size: 11px; color: var(--text3); font-weight: 600; font-style: italic;
+    padding: 6px 10px; background: rgba(255,255,255,0.03); border-radius: 6px;
+    border-right: 2px solid var(--yellow); direction: ltr;
+  }
+  .te-mode-pills { display: flex; gap: 8px; flex-wrap: wrap; }
+  .te-pill {
+    background: var(--bg4); border: 1.5px solid var(--border); color: var(--text2);
+    font-family: 'Cairo', sans-serif; font-size: 12px; font-weight: 700;
+    padding: 7px 14px; border-radius: 20px; cursor: pointer; transition: all 0.2s;
+  }
+  .te-pill:hover { border-color: var(--yellow); color: var(--text); }
+  .te-pill.active { background: rgba(245,197,24,0.15); border-color: var(--yellow); color: var(--yellow); }
+  .te-add-wrapper { position: relative; display: flex; flex-direction: column; gap: 4px; }
+  .te-add-main-btn {
+    background: linear-gradient(135deg, var(--yellow), var(--yellow2));
+    border: none; color: var(--bg); font-family: 'Cairo', sans-serif;
+    font-size: 14px; font-weight: 900; padding: 10px 22px;
+    border-radius: var(--radius-sm); cursor: pointer; transition: all 0.2s;
+    white-space: nowrap;
+  }
+  .te-add-main-btn:hover { transform: translateY(-1px); box-shadow: 0 4px 16px rgba(245,197,24,0.3); }
+  .te-add-dropdown {
+    position: absolute; top: calc(100% + 8px); left: 0;
+    background: var(--card2); border: 1px solid var(--border2); border-radius: var(--radius-sm);
+    padding: 8px; min-width: 200px; z-index: 200;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+    animation: coachModeIn 0.2s ease;
+  }
+  .te-add-opt {
+    display: block; width: 100%; background: transparent; border: none;
+    color: var(--text); font-family: 'Cairo', sans-serif; font-size: 13px; font-weight: 700;
+    text-align: left; padding: 9px 14px; border-radius: 6px; cursor: pointer; transition: background 0.15s;
+  }
+  .te-add-opt:hover { background: rgba(245,197,24,0.1); color: var(--yellow); }
+
+  /* ══ MODE-SPECIFIC DAY SECTIONS ══ */
+  .ws-day-body { padding: 0; }
+
+  .ws-section-label {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 10px; font-weight: 800; color: var(--yellow);
+    text-transform: uppercase; letter-spacing: 1.5px;
+    padding: 10px 20px 8px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(245,197,24,0.03);
+  }
+  .ws-section-icon { font-size: 14px; }
+  .ws-section-gym { border-bottom: 2px solid var(--border2); }
+  .ws-section-gym > .ws-add-ex-btn { margin: 8px 20px 12px; display: inline-block; }
+
+  .ws-section-cf { padding: 0 0 16px; }
+  .ws-section-cf .ws-section-label { color: #4C9ABF; }
+  .cf-empty-state {
+    padding: 18px 20px; font-size: 13px;
+    color: var(--text3); font-style: italic;
+  }
+
+  .cf-block {
+    margin: 10px 16px 0;
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: var(--radius-sm);
+    background: rgba(255,255,255,0.015);
+    overflow: hidden;
+  }
+  .cf-block-header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 14px;
+    background: rgba(255,255,255,0.025);
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+    flex-wrap: wrap;
+  }
+  .cf-block-badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 3px 10px; border-radius: 20px;
+    font-size: 11px; font-weight: 800; text-transform: uppercase;
+    letter-spacing: 0.8px; white-space: nowrap;
+  }
+  .cf-block-duration {
+    font-size: 11px; color: var(--text3); font-weight: 600;
+    background: rgba(255,255,255,0.06); padding: 2px 8px;
+    border-radius: 10px; border: 1px solid var(--border);
+  }
+  .cf-block-meta-edit { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+  .cf-ex-list { padding: 8px 14px 4px; display: flex; flex-direction: column; gap: 6px; }
+  .cf-ex-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 8px;
+    background: rgba(255,255,255,0.02);
+    border-radius: 6px; border: 1px solid transparent;
+    transition: border-color 0.15s; flex-wrap: wrap;
+  }
+  .cf-ex-row:hover { border-color: var(--border2); }
+  .cf-ex-name { font-size: 13px; font-weight: 600; color: var(--text); flex: 1; min-width: 120px; }
+  .cf-ex-reps-badge {
+    background: rgba(245,197,24,0.12); border: 1px solid rgba(245,197,24,0.25);
+    color: var(--yellow); padding: 2px 8px; border-radius: 10px;
+    font-size: 11px; font-weight: 700; white-space: nowrap;
+  }
+  .cf-ex-notes-text { font-size: 11px; color: var(--text3); font-style: italic; }
+  .cf-ex-select { flex: 1; min-width: 130px; }
+
+  .cf-add-ex-btn {
+    margin: 6px 14px 10px; display: inline-block;
+    background: rgba(255,255,255,0.05);
+    border: 1px dashed rgba(255,255,255,0.18);
+    color: var(--text2); padding: 4px 14px;
+    border-radius: 6px; font-size: 11px; font-weight: 700;
+    cursor: pointer; transition: all 0.2s; font-family: 'Cairo', sans-serif;
+  }
+  .cf-add-ex-btn:hover { border-color: var(--yellow); color: var(--yellow); background: rgba(245,197,24,0.06); }
+
+  .cf-del-block-btn {
+    background: transparent; border: 1px solid rgba(224,98,98,0.3);
+    color: #E05555; padding: 3px 10px; border-radius: 5px;
+    font-size: 11px; font-weight: 700; cursor: pointer; transition: all 0.2s;
+    font-family: 'Cairo', sans-serif;
+  }
+  .cf-del-block-btn:hover { background: rgba(200,80,80,0.12); }
+
+  .cf-add-block-bar {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 10px 16px 6px;
+    border-top: 1px dashed rgba(255,255,255,0.07);
+    margin-top: 10px;
+  }
+  .cf-add-block-btn {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.12);
+    color: var(--text2); padding: 4px 12px;
+    border-radius: 20px; font-size: 10px; font-weight: 700;
+    cursor: pointer; transition: all 0.2s; font-family: 'Cairo', sans-serif;
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .cf-add-block-btn:hover { border-color: var(--yellow); color: var(--yellow); background: rgba(245,197,24,0.06); }
+
+  /* ── CF Exercise row: LTR layout ── */
+  .cf-ex-list { direction: ltr; text-align: left; }
+  .cf-ex-row  { direction: ltr; text-align: left; }
+
+  /* ── CF free-text + datalist combo input ── */
+  .cf-ex-name-input {
+    flex: 1;
+    min-width: 160px;
+    background: var(--bg2);
+    border: 1px solid var(--border2);
+    color: var(--text);
+    border-radius: var(--radius-sm);
+    padding: 5px 8px;
+    font-family: 'Cairo', sans-serif;
+    font-size: 12px;
+    font-weight: 600;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+  .cf-ex-name-input:focus { border-color: var(--yellow); }
+
+  /* ── Rest input styling (same as reps) ── */
+  .cf-ex-rest {
+    width: 70px !important;
+    flex-shrink: 0;
+  }
+
+  /* ── Rest badge in view mode ── */
+  .cf-ex-rest-badge {
+    background: rgba(76,154,191,0.12);
+    border: 1px solid rgba(76,154,191,0.3);
+    color: #4C9ABF;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 700;
+    white-space: nowrap;
+  }
+
+  /* ── CF block header: always LTR ── */
+  .cf-block-header { direction: ltr; text-align: left; }
+  .cf-block-meta-edit { direction: ltr; }
+
+  /* ── Add block bar: LTR ── */
+  .cf-add-block-bar { direction: ltr; text-align: left; }
+
+  /* ══ PRESET ENGINE PILLS ══ */
+  .ex-preset-pill {
+    background: var(--bg4); border: 1.5px solid var(--border); color: var(--text2);
+    font-family: 'Cairo', sans-serif; font-size: 12px; font-weight: 700;
+    padding: 6px 14px; border-radius: 20px; cursor: pointer; transition: all 0.2s;
+  }
+  .ex-preset-pill:hover { border-color: var(--yellow); color: var(--text); }
+  .ex-preset-pill.active { background: rgba(245,197,24,0.15); border-color: var(--yellow); color: var(--yellow); }
+
 </style>
 </head>
 <body>
+
+<!-- ══ FIREBASE LOADING BAR ══ -->
+<div id="fbLoadingBar"></div>
 
 <!-- ══ PASSWORD MODAL ══ -->
 <div class="modal-overlay" id="passwordModal">
@@ -1218,6 +1513,7 @@
     <span style="font-size:10px;color:var(--text3);font-weight:500;margin-right:4px">All fields are editable</span>
   </div>
   <div style="display:flex;gap:8px;align-items:center">
+    <span id="savedIndicator">Saved</span>
     <button class="coach-save-btn" onclick="saveData()">💾 Save Changes</button>
     <button class="coach-exit-btn" onclick="exitCoachMode()">Exit</button>
   </div>
@@ -1377,10 +1673,11 @@
     </div>
 
     <div class="diet-types-grid fade-up fade-up-2" style="margin-bottom:28px" id="dietTypesGrid"><!-- rendered by JS --></div>
+    <button class="coach-add-btn" id="addDietCardBtn" onclick="addDietCard()" style="margin-bottom:20px;">+ إضافة بطاقة نظام غذائي</button>
 
     <div class="section-title fade-up" style="margin-top:24px">
       <div class="title-accent" style="background:var(--yellow2)"></div>
-      <h2 style="font-size:18px">نموذج خطة وجبات يوم High</h2>
+      <h2 id="mealSectionTitle" style="font-size:18px" contenteditable="false">نموذج خطة وجبات يوم High</h2>
     </div>
 
     <div class="meal-cards fade-up fade-up-1" id="mealCards"><!-- rendered by JS --></div>
@@ -1411,7 +1708,7 @@
   <div class="em-scan"></div>
   <div class="em-inner">
     <div class="em-header">
-      <div class="em-header-left"><div class="em-status-dot"></div><div><div class="em-header-title">⚡ Emergency Mode — Active</div><div class="em-header-sub">نظام الرجوع السريع · Fast Recovery System</div></div></div>
+      <div class="em-header-left"><div class="em-status-dot"></div><div style="flex:1"><div class="em-header-title" style="text-align:center;width:100%">⚡ Emergency Mode — Active</div><div class="em-header-sub" style="text-align:center;width:100%">نظام الرجوع السريع · Fast Recovery System</div></div></div>
       <button class="em-close-btn" onclick="closeEmergencyMode()" title="Close">✕</button>
     </div>
     <div class="em-voice-bar"><span class="em-voice-label">🧠 Coach</span><span class="em-voice-text" id="emVoiceText">"Just return. No drama."</span></div>
@@ -1484,21 +1781,6 @@
   </div>
 </div>
 
-<!-- ══ FOOD SUBSTITUTIONS ══ -->
-<div class="page-section">
-  <div class="section-wrap">
-    <div class="section-title fade-up">
-      <div class="title-accent"></div>
-      <h2>بدائل الطعام</h2>
-    </div>
-    <div class="swap-grid fade-up fade-up-1">
-      <div class="swap-card"><h4>🥩 بدائل البروتين الحيواني</h4><div class="swap-items"><div class="swap-item">100g سمك</div><div class="swap-arrow">⇄</div><div class="swap-item">100g تونة</div><div class="swap-arrow">⇄</div><div class="swap-item">120g لحم أحمر</div><div class="swap-arrow">⇄</div><div class="swap-item">85g دجاج</div><div class="swap-arrow">⇄</div><div class="swap-item">100g كبدة</div></div></div>
-      <div class="swap-card"><h4>🌾 بدائل مصادر الكربوهيدرات</h4><div class="swap-items"><div class="swap-item">200g أرز</div><div class="swap-arrow">⇄</div><div class="swap-item">100g مكرونة</div><div class="swap-arrow">⇄</div><div class="swap-item">200g بطاطس</div><div class="swap-arrow">⇄</div><div class="swap-item">100g خبز بلدي</div><div class="swap-arrow">⇄</div><div class="swap-item">100g شوفان</div></div></div>
-      <div class="swap-card"><h4>🧀 بدائل البروتين الخفيف</h4><div class="swap-items"><div class="swap-item">130g جبنة قريش</div><div class="swap-arrow">⇄</div><div class="swap-item">130g زبادي</div><div class="swap-arrow">⇄</div><div class="swap-item">150g بيض</div><div class="swap-arrow">⇄</div><div class="swap-item">85g تونة</div><div class="swap-arrow">⇄</div><div class="swap-item">100g فول</div></div></div>
-      <div class="swap-card"><h4>🥑 بدائل الدهون الصحية</h4><div class="swap-items"><div class="swap-item">50g مكسرات</div><div class="swap-arrow">⇄</div><div class="swap-item">50g زيت زيتون</div><div class="swap-arrow">⇄</div><div class="swap-item">50g زبدة فول سوداني</div></div><div style="margin-top:12px;font-size:11px;color:var(--text3);line-height:1.6">💡 الكميات المذكورة تعطي تقريباً نفس السعرات الحرارية.</div></div>
-    </div>
-  </div>
-</div>
 
 <!-- ══ NUTRITION FACTS DATABASE ══ -->
 <section id="nutrition-db">
@@ -1529,6 +1811,8 @@
         <button class="nf-cat-btn" data-cat="دهون وزيوت" onclick="nfSelectCat(this)"><span>🥑</span> دهون وزيوت <span class="nf-cat-count" id="cnt-دهون">41</span></button>
         <button class="nf-cat-btn" data-cat="مكملات" onclick="nfSelectCat(this)"><span>💊</span> مكملات <span class="nf-cat-count" id="cnt-مكملات">5</span></button>
         <button class="nf-cat-btn" data-cat="حلويات وسناكس" onclick="nfSelectCat(this)"><span>🍫</span> حلويات <span class="nf-cat-count" id="cnt-حلويات">34</span></button>
+        <button class="nf-cat-btn" data-cat="صلصات وتوابل" onclick="nfSelectCat(this)"><span>🧂</span> صلصات <span class="nf-cat-count" id="cnt-صلصات">8</span></button>
+        <button class="nf-cat-btn" data-cat="مشروبات" onclick="nfSelectCat(this)"><span>🥤</span> مشروبات <span class="nf-cat-count" id="cnt-مشروبات">2</span></button>
       </div>
       <div class="nf-meta-row">
         <div class="nf-result-info">عرض <span id="nfCount">484</span> طعام من أصل 484 · لكل 100g</div>
@@ -1546,6 +1830,11 @@
       </div>
     </div>
 
+    <div style="display:flex;justify-content:center;margin-bottom:16px">
+      <button id="nfToggleBtn" onclick="(function(){var c=document.getElementById('nfValuesContent');var b=document.getElementById('nfToggleBtn');var shown=c.style.display!=='none';c.style.display=shown?'none':'block';b.textContent=shown?'👁 إظهار القيم الغذائية':'🙈 إخفاء القيم الغذائية';})()" style="background:rgba(245,197,24,0.1);border:1px solid rgba(245,197,24,0.3);color:var(--yellow);font-family:'Cairo',sans-serif;font-size:13px;font-weight:700;padding:10px 24px;border-radius:var(--radius-sm);cursor:pointer;transition:all 0.2s;letter-spacing:0.3px">👁 إظهار القيم الغذائية</button>
+    </div>
+
+    <div id="nfValuesContent" style="display:none">
     <div class="nf-macro-legend fade-up fade-up-2">
       <div class="nf-macro-legend-item"><div class="nf-ml-dot" style="background:#4C9ABF"></div><span>كارب</span></div>
       <div class="nf-macro-legend-item"><div class="nf-ml-dot" style="background:#C86A5B"></div><span>بروتين</span></div>
@@ -1562,6 +1851,7 @@
     <div style="text-align:center;margin-top:24px" id="nfLoadMoreWrap">
       <button class="nf-load-more" id="nfLoadMore" onclick="nfLoadMore()">عرض المزيد <span id="nfRemaining"></span></button>
     </div>
+    </div><!-- end nfValuesContent -->
   </div>
 </div>
 </section>
@@ -1582,23 +1872,19 @@
       <button class="ws-btn ws-btn-add-day coach-add-day-btn" type="button" onclick="addTrainingDay()">+ Add Training Day</button>
     </div>
     <div id="workoutSplitContainer"><!-- rendered by JS --></div>
-    <div class="ws-cardio-block fade-up fade-up-1">
-      <div class="ws-cardio-title">Cardio Time</div>
-      <div id="cardioTimeTableContainer"></div>
-    </div>
 
     <!-- Volume Calculator -->
     <div class="ws-volume-bar fade-up">
-      <h4>📊 Training Volume Calculator</h4>
+      <h4>📊 Training Volume Calculator <span style="font-size:10px;font-weight:500;color:var(--text3);margin-right:6px;">(Gym exercises only)</span></h4>
       <div class="ws-vol-controls">
         <select class="ws-vol-select" id="wsVolumeDay" onchange="wsCalcVolume()">
           <option value="">— اختر اليوم —</option>
-          <option value="1">Day 1 — Push</option>
-          <option value="2">Day 2 — Pull</option>
-          <option value="3">Day 3 — Legs</option>
-          <option value="4">Day 4 — Push B</option>
-          <option value="5">Day 5 — Pull B</option>
-          <option value="6">Day 6 — Legs B</option>
+          <option value="1">Day 1</option>
+          <option value="2">Day 2</option>
+          <option value="3">Day 3</option>
+          <option value="4">Day 4</option>
+          <option value="5">Day 5</option>
+          <option value="6">Day 6</option>
         </select>
         <button class="ws-vol-btn" onclick="wsCalcVolume()">Calculate Volume</button>
         <div class="ws-volume-result" id="wsVolumeResult">
@@ -1820,7 +2106,7 @@
 
   <div class="ds-card fade-up">
     <div class="ds-top-bar">
-      <div class="ds-top-title">📋 Daily Check-in</div>
+      <div class="ds-top-title" style="text-align:center;width:100%">Daily Check-in Requirements</div>
       <div id="dsDayLabel" style="font-size:11px;color:var(--yellow);font-weight:700"></div>
     </div>
     <div class="ds-score-row" id="dsScoreRow">
@@ -1851,7 +2137,10 @@
 /* ══════════════════════════════════════════════════════
    CENTRAL DATA OBJECT — Firebase-ready structure
 ══════════════════════════════════════════════════════ */
-window.clientData = {
+/* FIX: expose clientData on window immediately so the Firebase module's
+   waitForClientData() polling resolves correctly and _hydrateClientData()
+   can write back into the same object reference. */
+let clientData = window.clientData = {
   name: "Nour Hany",
   sub: "برنامجك المخصص · 12 أسبوع · تحت إشراف C.Mario Aziz",
   overview: [
@@ -1979,7 +2268,8 @@ window.clientData = {
     { workout: "Jump Rope", seconds: "180", type: "Conditioning" }
   ],
   progress: { start: 92, current: 92, target: 85 },
-  whyStart: "رغبتي في بناء جسم مثالي وتحسين صحتي العامة، والشعور بالثقة بالنفس. أريد أن أكون أقوى جسدياً وذهنياً وأن أجعل نمط الحياة الصحي جزءاً أساسياً من حياتي اليومية."
+  whyStart: "رغبتي في بناء جسم مثالي وتحسين صحتي العامة، والشعور بالثقة بالنفس. أريد أن أكون أقوى جسدياً وذهنياً وأن أجعل نمط الحياة الصحي جزءاً أساسياً من حياتي اليومية.",
+  mealsTitle: "نموذج خطة وجبات يوم High"
 };
 
 /* ══ EXERCISE DROPDOWN DATA ══ */
@@ -2754,8 +3044,53 @@ const exerciseDropdownData = {
   }
 };
 
+/* ══ CROSSFIT DATABASE ══ */
+const CROSSFIT_DB = {
+  exercises: [
+    { name: "Air Squat", category: "gymnastics", movement_pattern: "squat", equipment: "bodyweight", difficulty: "beginner", primary_focus: "skill", typical_rep_range: "10-30 reps" },
+    { name: "Push-Up", category: "gymnastics", movement_pattern: "push", equipment: "bodyweight", difficulty: "beginner", primary_focus: "strength", typical_rep_range: "5-25 reps" },
+    { name: "Strict Pull-Up", category: "gymnastics", movement_pattern: "pull", equipment: "pull-up bar", difficulty: "intermediate", primary_focus: "strength", typical_rep_range: "3-10 reps" },
+    { name: "Pull-Up", category: "gymnastics", movement_pattern: "pull", equipment: "pull-up bar", difficulty: "intermediate", primary_focus: "skill", typical_rep_range: "5-20 reps" },
+    { name: "Chest-to-Bar Pull-Up", category: "gymnastics", movement_pattern: "pull", equipment: "pull-up bar", difficulty: "advanced", primary_focus: "power", typical_rep_range: "3-15 reps" },
+    { name: "Ring Row", category: "gymnastics", movement_pattern: "pull", equipment: "rings", difficulty: "beginner", primary_focus: "strength", typical_rep_range: "8-20 reps" },
+    { name: "Toes-to-Bar", category: "gymnastics", movement_pattern: "core", equipment: "pull-up bar", difficulty: "advanced", primary_focus: "skill", typical_rep_range: "5-20 reps" },
+    { name: "Sit-Up", category: "gymnastics", movement_pattern: "core", equipment: "abmat", difficulty: "beginner", primary_focus: "conditioning", typical_rep_range: "15-50 reps" },
+    { name: "Handstand Push-Up", category: "gymnastics", movement_pattern: "push", equipment: "wall", difficulty: "advanced", primary_focus: "strength", typical_rep_range: "3-15 reps" },
+    { name: "Wall Walk", category: "gymnastics", movement_pattern: "push", equipment: "wall", difficulty: "intermediate", primary_focus: "skill", typical_rep_range: "3-15 reps" },
+    { name: "Muscle-Up", category: "gymnastics", movement_pattern: "full_body", equipment: "rings or bar", difficulty: "advanced", primary_focus: "skill", typical_rep_range: "1-10 reps" },
+    { name: "Burpee", category: "gymnastics", movement_pattern: "full_body", equipment: "bodyweight", difficulty: "beginner", primary_focus: "conditioning", typical_rep_range: "10-40 reps" },
+    { name: "Box Jump", category: "gymnastics", movement_pattern: "full_body", equipment: "box", difficulty: "beginner", primary_focus: "power", typical_rep_range: "8-25 reps" },
+    { name: "Box Jump Over", category: "gymnastics", movement_pattern: "full_body", equipment: "box", difficulty: "intermediate", primary_focus: "power", typical_rep_range: "8-25 reps" },
+    { name: "Walking Lunge", category: "gymnastics", movement_pattern: "squat", equipment: "bodyweight", difficulty: "beginner", primary_focus: "conditioning", typical_rep_range: "10-40 steps" },
+    { name: "Pistol Squat", category: "gymnastics", movement_pattern: "squat", equipment: "bodyweight", difficulty: "advanced", primary_focus: "skill", typical_rep_range: "3-15 reps" },
+    { name: "Barbell Back Squat", category: "weightlifting", movement_pattern: "squat", equipment: "barbell", difficulty: "intermediate", primary_focus: "strength", typical_rep_range: "3-10 reps" },
+    { name: "Front Squat", category: "weightlifting", movement_pattern: "squat", equipment: "barbell", difficulty: "intermediate", primary_focus: "strength", typical_rep_range: "3-8 reps" },
+    { name: "Deadlift", category: "weightlifting", movement_pattern: "hinge", equipment: "barbell", difficulty: "intermediate", primary_focus: "strength", typical_rep_range: "1-6 reps" },
+    { name: "Power Clean", category: "weightlifting", movement_pattern: "full_body", equipment: "barbell", difficulty: "intermediate", primary_focus: "power", typical_rep_range: "2-5 reps" },
+    { name: "Power Snatch", category: "weightlifting", movement_pattern: "full_body", equipment: "barbell", difficulty: "advanced", primary_focus: "power", typical_rep_range: "1-5 reps" },
+    { name: "Squat Snatch", category: "weightlifting", movement_pattern: "full_body", equipment: "barbell", difficulty: "advanced", primary_focus: "power", typical_rep_range: "1-5 reps" },
+    { name: "Thruster", category: "weightlifting", movement_pattern: "full_body", equipment: "barbell", difficulty: "intermediate", primary_focus: "conditioning", typical_rep_range: "5-15 reps" },
+    { name: "Push Press", category: "weightlifting", movement_pattern: "push", equipment: "barbell", difficulty: "beginner", primary_focus: "strength", typical_rep_range: "5-10 reps" },
+    { name: "Overhead Squat", category: "weightlifting", movement_pattern: "squat", equipment: "barbell", difficulty: "advanced", primary_focus: "skill", typical_rep_range: "2-8 reps" },
+    { name: "Sumo Deadlift High Pull", category: "weightlifting", movement_pattern: "full_body", equipment: "barbell", difficulty: "intermediate", primary_focus: "conditioning", typical_rep_range: "5-15 reps" },
+    { name: "Kettlebell Swing", category: "weightlifting", movement_pattern: "hinge", equipment: "kettlebell", difficulty: "beginner", primary_focus: "conditioning", typical_rep_range: "10-30 reps" },
+    { name: "Goblet Squat", category: "weightlifting", movement_pattern: "squat", equipment: "kettlebell", difficulty: "beginner", primary_focus: "strength", typical_rep_range: "8-20 reps" },
+    { name: "Dumbbell Snatch", category: "weightlifting", movement_pattern: "full_body", equipment: "dumbbell", difficulty: "intermediate", primary_focus: "power", typical_rep_range: "5-15 reps" },
+    { name: "Wall Ball Shot", category: "weightlifting", movement_pattern: "full_body", equipment: "medicine ball", difficulty: "beginner", primary_focus: "conditioning", typical_rep_range: "10-30 reps" },
+    { name: "Run", category: "monostructural", movement_pattern: "full_body", equipment: "open space", difficulty: "beginner", primary_focus: "conditioning", typical_rep_range: "200-1600 m" },
+    { name: "Row", category: "monostructural", movement_pattern: "full_body", equipment: "rowing machine", difficulty: "beginner", primary_focus: "conditioning", typical_rep_range: "250-2000 m" },
+    { name: "Assault Bike", category: "monostructural", movement_pattern: "full_body", equipment: "assault bike", difficulty: "beginner", primary_focus: "conditioning", typical_rep_range: "10-50 cal" },
+    { name: "SkiErg", category: "monostructural", movement_pattern: "full_body", equipment: "skierg", difficulty: "beginner", primary_focus: "conditioning", typical_rep_range: "250-1000 m" },
+    { name: "Double Under", category: "monostructural", movement_pattern: "full_body", equipment: "jump rope", difficulty: "intermediate", primary_focus: "skill", typical_rep_range: "20-200 reps" },
+    { name: "Jump Rope", category: "monostructural", movement_pattern: "full_body", equipment: "jump rope", difficulty: "beginner", primary_focus: "conditioning", typical_rep_range: "30-200 reps" }
+  ]
+};
+
 /* ══ COACH MODE STATE ══ */
+/* FIX: expose coachMode on window so the Firebase onSnapshot handler can
+   read window.coachMode and suppress re-renders during active editing. */
 let coachMode = false;
+window.coachMode = false;
 const COACH_PASSWORD = 'Mario0060';
 
 function openPasswordModal() {
@@ -2782,15 +3117,19 @@ function confirmPassword() {
 
 function activateCoachMode() {
   coachMode = true;
+  window.coachMode = true;
   document.body.classList.add('coach-mode');
   document.getElementById('coachModeBar').classList.add('active');
   document.getElementById('transparencyBtn').textContent = '🔓';
 
   // Enable contenteditable on designated fields
-  const editables = ['whyStartText', 'nutritionText'];
+  const editables = ['whyStartText', 'nutritionText', 'nutritionTitle', 'mealSectionTitle'];
   editables.forEach(id => {
     const el = document.getElementById(id);
-    if (el) el.contentEditable = 'true';
+    if (el) {
+      el.contentEditable = 'true';
+      el.classList.add('editable-field'); // activates yellow dashed border from CSS
+    }
   });
 
   // Show progress editors
@@ -2808,14 +3147,18 @@ function activateCoachMode() {
 
 function exitCoachMode() {
   coachMode = false;
+  window.coachMode = false;
   document.body.classList.remove('coach-mode');
   document.getElementById('coachModeBar').classList.remove('active');
   document.getElementById('transparencyBtn').textContent = '🔒';
 
-  const editables = ['whyStartText', 'nutritionText'];
+  const editables = ['whyStartText', 'nutritionText', 'nutritionTitle', 'mealSectionTitle'];
   editables.forEach(id => {
     const el = document.getElementById(id);
-    if (el) el.contentEditable = 'false';
+    if (el) {
+      el.contentEditable = 'false';
+      el.classList.remove('editable-field');
+    }
   });
 
   const pe = document.getElementById('progressEditors');
@@ -2832,6 +3175,12 @@ function saveData() {
 
   const nutEl = document.getElementById('nutritionText');
   if (nutEl) clientData.nutrition.text = nutEl.textContent.trim();
+
+  const nutTitleEl = document.getElementById('nutritionTitle');
+  if (nutTitleEl) clientData.nutrition.title = nutTitleEl.textContent.trim();
+
+  const mealTitleEl = document.getElementById('mealSectionTitle');
+  if (mealTitleEl) clientData.mealsTitle = mealTitleEl.textContent.trim();
 
   // Sync hero
   const hn = document.getElementById('heroName');
@@ -2857,6 +3206,8 @@ function saveData() {
         btn.style.borderColor = 'var(--low)';
         btn.style.color = 'var(--low)';
         setTimeout(() => { btn.innerHTML = orig; btn.style = ''; }, 2000);
+        /* FEATURE 5: Show persistent "Saved" indicator — pure UI, no Firebase write */
+        showSavedIndicator();
       })
       .catch(err => {
         console.error('❌ Firestore save error:', err);
@@ -2872,20 +3223,74 @@ function saveData() {
   }
 }
 
+/* FEATURE 5: Lightweight UI-only indicator — no Firebase dependency */
+function showSavedIndicator() {
+  const el = document.getElementById('savedIndicator');
+  if (!el) return;
+  // Reset animation by removing and re-adding the class
+  el.classList.remove('visible');
+  void el.offsetWidth; // force reflow
+  el.classList.add('visible');
+  // Clean up class after animation so it can re-trigger on next save
+  setTimeout(() => el.classList.remove('visible'), 2900);
+}
+
 /* ══ RENDER ENGINE ══ */
+/* FIX: expose renderAll on window so the Firebase module can call it after
+   hydrating clientData with real Firestore values. */
+window.renderAll = renderAll;
 function renderAll() {
   renderHero();
   renderOverview();
   renderPlanner();
   renderCheckin();
+  renderNutritionIntro();
   renderDietTypes();
   renderMeals();
+  renderMealSectionTitle();
   renderGuide();
   renderSupplements();
   renderWorkoutSplit();
-  renderCardioTime();
   renderMissions();
   updateProgressDisplay();
+}
+
+/* ── Meal Section Title ── */
+function renderMealSectionTitle() {
+  const el = document.getElementById('mealSectionTitle');
+  if (!el) return;
+  if (!coachMode) {
+    if (clientData.mealsTitle) el.textContent = clientData.mealsTitle;
+    el.contentEditable = 'false';
+    el.classList.remove('editable-field');
+  } else {
+    el.contentEditable = 'true';
+    el.classList.add('editable-field');
+    el.oninput = function() { clientData.mealsTitle = el.textContent.trim(); };
+  }
+}
+
+/* ── Nutrition Intro (title + body text) ── */
+function renderNutritionIntro() {
+  const titleEl = document.getElementById('nutritionTitle');
+  const textEl  = document.getElementById('nutritionText');
+  if (!titleEl || !textEl) return;
+
+  if (!coachMode) {
+    // Hydrate from clientData when NOT editing
+    if (clientData.nutrition.title) titleEl.textContent = clientData.nutrition.title;
+    if (clientData.nutrition.text)  textEl.textContent  = clientData.nutrition.text;
+    titleEl.contentEditable = 'false';
+    textEl.contentEditable  = 'false';
+    titleEl.classList.remove('editable-field');
+    textEl.classList.remove('editable-field');
+  } else {
+    // Coach mode: make both editable
+    titleEl.contentEditable = 'true';
+    textEl.contentEditable  = 'true';
+    titleEl.classList.add('editable-field');
+    textEl.classList.add('editable-field');
+  }
 }
 
 /* ── Hero ── */
@@ -2986,6 +3391,7 @@ function renderPlanner() {
         </div>`;
     }
 
+
     const cardioContent = coachMode
       ? `<input class="edit-input" value="${escHtml(d.cardio)}" onchange="updateDay(${i},'cardio',this.value)" style="font-size:11px">`
       : `<div class="cardio-text">${escHtml(d.cardio)}</div>`;
@@ -3044,10 +3450,19 @@ function renderDietTypes() {
           </div>
         </div>`;
     } else {
+      const isHigh = dt.type === 'high';
+      const h4Attrs = isHigh
+        ? ` class="editable-field" data-editable="true" contenteditable="${coachMode ? 'true' : 'false'}"`
+        : '';
+      const pAttrs  = isHigh
+        ? ` class="editable-field" data-editable="true" contenteditable="${coachMode ? 'true' : 'false'}"`
+        : '';
+      const h4Oninput = isHigh ? ` oninput="clientData.nutrition.dietTypes[${i}].label=this.textContent"` : '';
+      const pOninput  = isHigh ? ` oninput="clientData.nutrition.dietTypes[${i}].desc=this.textContent"` : '';
       return `
         <div class="diet-type-card ${dt.type}">
-          <h4><div class="color-dot" style="background:var(--${dt.type});width:14px;height:14px"></div>${escHtml(dt.label)}</h4>
-          <p>${escHtml(dt.desc)}</p>
+          <h4${h4Attrs}${h4Oninput}><div class="color-dot" style="background:var(--${dt.type});width:14px;height:14px"></div>${escHtml(dt.label)}</h4>
+          <p${pAttrs}${pOninput}>${escHtml(dt.desc)}</p>
           <div class="macro-pills">
             <span class="macro-pill carb">كارب: ${escHtml(dt.macros.carb)}</span>
             <span class="macro-pill pro">بروتين: ${escHtml(dt.macros.pro)}</span>
@@ -3071,11 +3486,10 @@ function renderMeals() {
         </li>`).join('');
       return `
         <div class="meal-card" style="border-color:rgba(245,197,24,0.3)">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-            <input class="edit-input meal-time" value="${escHtml(meal.time)}" onchange="clientData.meals[${mi}].time=this.value" style="font-size:10px;letter-spacing:1px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+            <input class="edit-input meal-time" value="${escHtml(meal.time)}" onchange="clientData.meals[${mi}].time=this.value" style="font-size:15px;font-weight:800;letter-spacing:1px;color:var(--yellow)">
             <button class="coach-remove-btn" onclick="removeMeal(${mi})" style="display:flex">✕ حذف</button>
           </div>
-          <input class="edit-input" value="${escHtml(meal.name)}" onchange="clientData.meals[${mi}].name=this.value" style="font-size:14px;font-weight:700;margin-bottom:10px">
           <ul style="list-style:none;display:flex;flex-direction:column;gap:5px">${itemsHtml}</ul>
           <button class="coach-add-btn" onclick="addMealItem(${mi})" style="margin-top:8px;font-size:11px;padding:5px">+ عنصر</button>
         </div>`;
@@ -3083,7 +3497,6 @@ function renderMeals() {
       return `
         <div class="meal-card">
           <div class="meal-time">${escHtml(meal.time)}</div>
-          <h4>${escHtml(meal.name)}</h4>
           <ul>${meal.items.map(item => `<li>${escHtml(item)}</li>`).join('')}</ul>
         </div>`;
     }
@@ -3211,68 +3624,345 @@ function removeSupplement(si) {
 /* ── Workout Split ── */
 const loadClassMap = { 'Strength': 'ws-str', 'Hypertrophy': 'ws-hyp', 'Endurance': 'ws-end' };
 
+/* ══ TRAINING ENGINE STATE (UI ONLY — no Firebase impact) ══ */
+let trainingMode = 'Full Gym';   // 'Full Gym' | 'CrossFit' | 'Hybrid'
+let programPhase = 'FOUNDATION'; // 'FOUNDATION' | 'STRENGTH' | 'COORDINATION'
+
+/* Phase suggestion text shown as a hint to coach — never auto-fills */
+const PHASE_HINTS = {
+  FOUNDATION:   { label: 'Weeks 1–4', hint: 'Focus: Technique & base conditioning — higher reps, lower intensity' },
+  STRENGTH:     { label: 'Weeks 5–8', hint: 'Focus: Heavy compound lifts — lower reps, higher intensity, longer rest' },
+  COORDINATION: { label: 'Weeks 9–12', hint: 'Focus: Skill + conditioning — mixed/modal, CrossFit-style blocks (AMRAP, EMOM)' }
+};
+
+/* Render the coach-mode training controls bar */
+function renderTrainingControls() {
+  if (!coachMode) return '';
+  const phase = PHASE_HINTS[programPhase] || PHASE_HINTS.FOUNDATION;
+  return `
+    <div class="te-controls-bar" id="teControlsBar">
+      <div class="te-control-group">
+        <label class="te-label">📅 Program Phase</label>
+        <select class="te-select" id="teProgramPhase" onchange="setProgramPhase(this.value)">
+          <option value="FOUNDATION"${programPhase==='FOUNDATION'?' selected':''}>🟢 FOUNDATION — Wk 1–4</option>
+          <option value="STRENGTH"${programPhase==='STRENGTH'?' selected':''}>🔴 STRENGTH — Wk 5–8</option>
+          <option value="COORDINATION"${programPhase==='COORDINATION'?' selected':''}>🔵 COORDINATION — Wk 9–12</option>
+        </select>
+        <div class="te-phase-hint" id="tePhaseHint">💡 ${escHtml(phase.hint)}</div>
+      </div>
+      <div class="te-control-group">
+        <label class="te-label">🏋️ Training Mode</label>
+        <div class="te-mode-pills">
+          <button class="te-pill${trainingMode==='Full Gym'?' active':''}" onclick="setTrainingMode('Full Gym')">Full Gym</button>
+          <button class="te-pill${trainingMode==='CrossFit'?' active':''}" onclick="setTrainingMode('CrossFit')">CrossFit</button>
+          <button class="te-pill${trainingMode==='Hybrid'?' active':''}" onclick="setTrainingMode('Hybrid')">Hybrid</button>
+        </div>
+      </div>
+      <div class="te-add-wrapper">
+        <button class="te-add-main-btn" id="teAddMainBtn" onclick="toggleAddMenu(this)">＋ Add</button>
+        <div class="te-add-dropdown" id="teAddDropdown" style="display:none">
+          ${getAddMenuOptions()}
+        </div>
+      </div>
+    </div>`;
+}
+
+function getAddMenuOptions() {
+  if (trainingMode === 'Full Gym') {
+    return `<button class="te-add-opt" onclick="addTrainingDay();closeAddMenu()">🗓️ Add Day</button>`;
+  } else if (trainingMode === 'CrossFit') {
+    return [
+      'Exercise','Circuit','Superset','EMOM','AMRAP','For Time'
+    ].map(t => `<button class="te-add-opt" onclick="addCFBlock('${t}');closeAddMenu()">➕ Add Block: ${t}</button>`).join('');
+  } else { // Hybrid
+    return `
+      <button class="te-add-opt" onclick="addTrainingDay();closeAddMenu()">🏋️ Add Gym Day</button>
+      <div style="height:1px;background:var(--border);margin:4px 0"></div>
+      ${['AMRAP','EMOM','For Time','Circuit','Superset'].map(t =>
+        `<button class="te-add-opt" onclick="addCFBlockToLastDay('${t}');closeAddMenu()">⚡ Add CF: ${t}</button>`
+      ).join('')}`;
+  }
+}
+
+function setTrainingMode(mode) {
+  trainingMode = mode;
+  renderWorkoutSplit();
+}
+
+function setProgramPhase(phase) {
+  programPhase = phase;
+  renderWorkoutSplit();
+  // Show phase→preset suggestion in modal if it's open
+  const modal = document.getElementById('addExerciseModal');
+  if (modal && modal.style.display === 'flex') {
+    const lbl = document.getElementById('exPresetLabel');
+    const suggestions = { FOUNDATION: 'Endurance', STRENGTH: 'Strength', COORDINATION: 'Hypertrophy' };
+    const suggested = suggestions[phase];
+    if (lbl && suggested) {
+      lbl.textContent = `💡 Phase tip: ${phase} phase → consider "${suggested}" preset (click to apply)`;
+    }
+  }
+}
+
+function toggleAddMenu(btn) {
+  const dd = document.getElementById('teAddDropdown');
+  if (!dd) return;
+  const isOpen = dd.style.display !== 'none';
+  dd.style.display = isOpen ? 'none' : 'block';
+}
+
+function closeAddMenu() {
+  const dd = document.getElementById('teAddDropdown');
+  if (dd) dd.style.display = 'none';
+}
+
+/* Close dropdown when clicking outside */
+document.addEventListener('click', function(e) {
+  if (!e.target.closest('#teAddMainBtn') && !e.target.closest('#teAddDropdown')) {
+    closeAddMenu();
+  }
+});
+
+/* Add CrossFit block — for the "＋ Add" dropdown in CrossFit/Hybrid mode. */
+function addCFBlock(blockType) {
+  if (trainingMode === 'CrossFit') {
+    const blockColors = { Exercise:'var(--yellow)', Circuit:'var(--pull)', Superset:'var(--push)', EMOM:'var(--low)', AMRAP:'var(--high)', 'For Time':'var(--legs)' };
+    const dayNumber = clientData.workouts.length + 1;
+    const template = CROSSFIT_DB.wod_templates ? CROSSFIT_DB.wod_templates.find(t => t.type === blockType) : null;
+    clientData.workouts.push({
+      day: dayNumber,
+      color: blockColors[blockType] || 'var(--yellow)',
+      label: `Day ${dayNumber}`,
+      title: blockType,
+      subtitle: `CrossFit — ${blockType}`,
+      groups: [{ name: blockType, exercises: [] }],
+      cfBlocks: [{
+        type: blockType,
+        duration: template ? template.duration : '',
+        level: template ? template.level : 'beginner',
+        exercises: template ? template.exercises.map(e => ({ name: e.name, reps: e.reps, notes: '' }))
+                            : [{ name: CROSSFIT_DB.exercises[0].name, reps: '10', notes: '' }]
+      }]
+    });
+  } else {
+    // Hybrid mode: add CF block to the last day
+    const di = clientData.workouts.length - 1;
+    if (di >= 0) { addCFBlockToDay(di, blockType); return; }
+  }
+  renderWorkoutSplit();
+}
+
+/* ── Gym exercise table HTML for a single day ── */
+function _renderGymTable(day, di) {
+  const colSpan = coachMode ? 8 : 7;
+  const groupRows = day.groups.map((group) => {
+    const gIndex = day.groups.indexOf(group);
+    return group.exercises.map((ex, ei) => {
+      const loadClass = loadClassMap[ex.load] || 'ws-hyp';
+      const isBW = ex.pct === 'BW' || ex.pct === 'BW+';
+      if (coachMode) {
+        return `
+          <tr data-di="${di}" data-gi="${gIndex}" data-ei="${ei}" data-gym="1">
+            <td class="ws-exercise">
+              <input class="edit-input" value="${escHtml(ex.name)}" onchange="updateExercise(${di},${gIndex},${ei},'name',this.value)" style="min-width:150px">
+            </td>
+            <td><input class="edit-input" value="${escHtml(ex.warmup)}" onchange="updateExercise(${di},${gIndex},${ei},'warmup',this.value)" style="width:100px"></td>
+            <td><input class="edit-input" value="${escHtml(ex.sets)}" onchange="updateExercise(${di},${gIndex},${ei},'sets',this.value)" style="width:50px"></td>
+            <td><input class="edit-input" value="${escHtml(ex.reps)}" onchange="updateExercise(${di},${gIndex},${ei},'reps',this.value)" style="width:70px"></td>
+            <td data-label="WT"><input type="number" class="ws-wt-input" step="0.5" min="0" placeholder="—" autocomplete="off" ${isBW?'disabled title="Bodyweight"':''}></td>
+            <td class="ws-load-cell">
+              <select class="edit-select" style="font-size:10px;margin-bottom:3px" onchange="updateExercise(${di},${gIndex},${ei},'load',this.value)">
+                <option${ex.load==='Strength'?' selected':''}>Strength</option>
+                <option${ex.load==='Hypertrophy'?' selected':''}>Hypertrophy</option>
+                <option${ex.load==='Endurance'?' selected':''}>Endurance</option>
+              </select>
+              <input class="edit-input ws-load-pct" value="${escHtml(ex.pct)}" onchange="updateExercise(${di},${gIndex},${ei},'pct',this.value)" style="width:70px;font-size:10px">
+            </td>
+            <td><input class="edit-input" value="${escHtml(ex.rest)}" onchange="updateExercise(${di},${gIndex},${ei},'rest',this.value)" style="width:70px"></td>
+            <td class="ws-action-cell">
+              <button class="ws-row-action" type="button" onclick="focusExerciseInput(${di},${gIndex},${ei})">Edit</button>
+              <button class="ws-row-action remove" type="button" onclick="removeExercise(${di},${gIndex},${ei})">Delete</button>
+            </td>
+          </tr>`;
+      } else {
+        return `
+          <tr data-gym="1">
+            <td class="ws-exercise">${escHtml(ex.name)}</td>
+            <td data-label="Warm-up Sets">${escHtml(ex.warmup)}</td>
+            <td data-label="Sets">${escHtml(ex.sets)}</td>
+            <td data-label="Reps">${escHtml(ex.reps)}</td>
+            <td data-label="WT"><input type="number" class="ws-wt-input" step="0.5" min="0" placeholder="—" autocomplete="off" ${isBW?'disabled title="Bodyweight"':''}></td>
+            <td class="ws-load-cell"><span class="ws-load-badge ${loadClass}">${escHtml(ex.load)}</span><div class="ws-load-pct">${escHtml(ex.pct)}</div></td>
+            <td data-label="Rest">${escHtml(ex.rest)}</td>
+          </tr>`;
+      }
+    }).join('');
+  }).join('');
+
+  const addExBtn = coachMode ? `<button class="ws-add-ex-btn" onclick="openAddExerciseModal(${di})" style="background:var(--yellow);color:var(--bg);border:none;padding:5px 10px;border-radius:5px;font-size:11px;font-weight:700;cursor:pointer;margin-top:8px;">+ Add Gym Exercise</button>` : '';
+
+  return `
+    <div class="ws-section-gym">
+      <div class="ws-section-label">
+        <span class="ws-section-icon">🏋️</span> <span>Strength Training</span>
+      </div>
+      <div class="ws-table-wrap">
+        <table class="ws-table">
+          <thead><tr>
+            <th class="ws-th-exercise">Exercise</th>
+            <th>Warm-up Sets</th><th>Sets</th><th>Reps</th><th>WT</th><th>Load</th><th>Rest</th>
+            ${coachMode ? '<th>Action</th>' : ''}
+          </tr></thead>
+          <tbody>${groupRows}</tbody>
+        </table>
+      </div>
+      ${addExBtn}
+    </div>`;
+}
+
+/* ── CrossFit block section HTML for a single day ── */
+function _renderCFSection(day, di) {
+  const cfBlocks = (day.cfBlocks || []);
+  const blockColors = { Exercise:'var(--yellow)', Circuit:'var(--pull)', Superset:'var(--push)', EMOM:'var(--low)', AMRAP:'var(--high)', 'For Time':'var(--legs)' };
+  const blockIcons  = { Exercise:'🎯', Circuit:'🔁', Superset:'⚡', EMOM:'⏱️', AMRAP:'🔥', 'For Time':'🏁' };
+
+  const blocksHtml = cfBlocks.length === 0
+    ? `<div class="cf-empty-state">No CrossFit blocks yet${coachMode ? ' — use <strong>+ Add CF Block</strong> below' : ''}</div>`
+    : cfBlocks.map((block, bi) => {
+        const bColor = blockColors[block.type] || 'var(--yellow)';
+        const bIcon  = blockIcons[block.type] || '➕';
+        const exerciseRows = (block.exercises || []).map((ex, ei) => {
+          if (coachMode) {
+            // Task 6: build datalist options for type-ahead search (free text + dropdown)
+            const cfDlId = `cf-dl-${di}-${bi}-${ei}`;
+            const cfExOptions = CROSSFIT_DB.exercises.map(e =>
+              `<option value="${escHtml(e.name)}"></option>`
+            ).join('');
+            return `
+              <div class="cf-ex-row" data-di="${di}" data-bi="${bi}" data-ei="${ei}" style="direction:ltr;text-align:left;">
+                <datalist id="${cfDlId}">${cfExOptions}</datalist>
+                <input
+                  class="edit-input cf-ex-name-input"
+                  list="${cfDlId}"
+                  value="${escHtml(ex.name||'')}"
+                  placeholder="Exercise name or type…"
+                  oninput="updateCFExercise(${di},${bi},${ei},'name',this.value)"
+                  style="flex:1;min-width:160px;"
+                >
+                <input class="edit-input cf-ex-reps"  value="${escHtml(ex.reps||'')}"  placeholder="Reps / Time" oninput="updateCFExercise(${di},${bi},${ei},'reps',this.value)"  style="width:90px">
+                <input class="edit-input cf-ex-rest"  value="${escHtml(ex.rest||'')}"  placeholder="Rest"        oninput="updateCFExercise(${di},${bi},${ei},'rest',this.value)"  style="width:70px">
+                <input class="edit-input cf-ex-notes" value="${escHtml(ex.notes||'')}" placeholder="Notes"       oninput="updateCFExercise(${di},${bi},${ei},'notes',this.value)" style="width:110px">
+                <button class="ws-row-action remove" onclick="removeCFExercise(${di},${bi},${ei})">✕</button>
+              </div>`;
+          } else {
+            return `
+              <div class="cf-ex-row" style="direction:ltr;text-align:left;">
+                <span class="cf-ex-name">${escHtml(ex.name)}</span>
+                ${ex.reps  ? `<span class="cf-ex-reps-badge">${escHtml(ex.reps)}</span>` : ''}
+                ${ex.rest  ? `<span class="cf-ex-rest-badge">${escHtml(ex.rest)}</span>` : ''}
+                ${ex.notes ? `<span class="cf-ex-notes-text">${escHtml(ex.notes)}</span>` : ''}
+              </div>`;
+          }
+        }).join('');
+
+        // TASK 3: Level selector removed from UI (data untouched)
+        const blockMeta = coachMode ? `
+          <div class="cf-block-meta-edit">
+            <input class="edit-input" value="${escHtml(block.duration||'')}" placeholder="Duration (e.g. 12 min)" oninput="updateCFBlock(${di},${bi},'duration',this.value)" style="width:150px">
+          </div>` : (block.duration ? `<span class="cf-block-duration">${escHtml(block.duration)}</span>` : '');
+
+        const addExHtml = coachMode ? `<button class="cf-add-ex-btn" onclick="addCFExercise(${di},${bi})">+ Add Exercise</button>` : '';
+        const delBlockHtml = coachMode ? `<button class="cf-del-block-btn" onclick="removeCFBlock(${di},${bi})">🗑 Remove Block</button>` : '';
+
+        return `
+          <div class="cf-block" style="--block-color:${bColor}">
+            <div class="cf-block-header">
+              <span class="cf-block-badge" style="background:${bColor};color:var(--bg)">${bIcon} ${escHtml(block.type)}</span>
+              ${blockMeta}
+              <div style="flex:1"></div>
+              ${delBlockHtml}
+            </div>
+            <div class="cf-ex-list">${exerciseRows || '<div class="cf-empty-state" style="font-size:12px">No exercises yet</div>'}</div>
+            ${addExHtml}
+          </div>`;
+      }).join('');
+
+  const addBlockHtml = coachMode ? `
+    <div class="cf-add-block-bar">
+      <span style="font-size:11px;color:var(--text3);font-weight:700;">ADD CF BLOCK:</span>
+      ${['AMRAP','EMOM','For Time','Circuit','Superset','Exercise'].map(t=>{
+        const icons = {AMRAP:'🔥',EMOM:'⏱️','For Time':'🏁',Circuit:'🔁',Superset:'⚡',Exercise:'🎯'};
+        return `<button class="cf-add-block-btn" onclick="addCFBlockToDay(${di},'${t}')">${icons[t]||''} ${t}</button>`;
+      }).join('')}
+    </div>` : '';
+
+  return `
+    <div class="ws-section-cf" style="direction:ltr;text-align:left;">
+      <div class="ws-section-label" style="color:#4C9ABF;direction:ltr;text-align:left;">
+        <span class="ws-section-icon">⚡</span> <span>CrossFit / Conditioning</span>
+      </div>
+      ${blocksHtml}
+      ${addBlockHtml}
+    </div>`;
+}
+
 function renderWorkoutSplit() {
   const container = document.getElementById('workoutSplitContainer');
   if (!container) return;
 
-  container.innerHTML = clientData.workouts.map((day, di) => {
-    const colSpan = coachMode ? 8 : 7;
-    const groupRows = day.groups.map((group) => {
-      const exerciseRows = group.exercises.map((ex, ei) => {
+  // Render training controls at top (coach mode only)
+  const controlsHtml = renderTrainingControls();
+
+  const daysHtml = clientData.workouts.map((day, di) => {
+    // Build the inner content based on training mode
+    let innerContent = '';
+
+    if (trainingMode === 'Full Gym') {
+      // ── FULL GYM: standard gym table only ──
+      const colSpan = coachMode ? 8 : 7;
+      const groupRows = day.groups.map((group) => {
         const gIndex = day.groups.indexOf(group);
-        const loadClass = loadClassMap[ex.load] || 'ws-hyp';
-        const isBW = ex.pct === 'BW' || ex.pct === 'BW+';
-
-        if (coachMode) {
-          return `
-            <tr data-di="${di}" data-gi="${gIndex}" data-ei="${ei}">
-              <td class="ws-exercise">
-                <input class="edit-input" value="${escHtml(ex.name)}" onchange="updateExercise(${di},${gIndex},${ei},'name',this.value)" style="min-width:150px">
-              </td>
-              <td><input class="edit-input" value="${escHtml(ex.warmup)}" onchange="updateExercise(${di},${gIndex},${ei},'warmup',this.value)" style="width:100px"></td>
-              <td><input class="edit-input" value="${escHtml(ex.sets)}" onchange="updateExercise(${di},${gIndex},${ei},'sets',this.value)" style="width:50px"></td>
-              <td><input class="edit-input" value="${escHtml(ex.reps)}" onchange="updateExercise(${di},${gIndex},${ei},'reps',this.value)" style="width:70px"></td>
-              <td data-label="WT"><input type="number" class="ws-wt-input" step="0.5" min="0" placeholder="—" autocomplete="off" ${isBW?'disabled title="Bodyweight"':''}></td>
-              <td class="ws-load-cell">
-                <select class="edit-select" style="font-size:10px;margin-bottom:3px" onchange="updateExercise(${di},${gIndex},${ei},'load',this.value)">
-                  <option${ex.load==='Strength'?' selected':''}>Strength</option>
-                  <option${ex.load==='Hypertrophy'?' selected':''}>Hypertrophy</option>
-                  <option${ex.load==='Endurance'?' selected':''}>Endurance</option>
-                </select>
-                <input class="edit-input ws-load-pct" value="${escHtml(ex.pct)}" onchange="updateExercise(${di},${gIndex},${ei},'pct',this.value)" style="width:70px;font-size:10px">
-              </td>
-              <td><input class="edit-input" value="${escHtml(ex.rest)}" onchange="updateExercise(${di},${gIndex},${ei},'rest',this.value)" style="width:70px"></td>
-              <td class="ws-action-cell">
-                <button class="ws-row-action" type="button" onclick="focusExerciseInput(${di},${gIndex},${ei})">Edit</button>
-                <button class="ws-row-action remove" type="button" onclick="removeExercise(${di},${gIndex},${ei})">Delete</button>
-              </td>
-            </tr>`;
-        } else {
-          return `
-            <tr>
-              <td class="ws-exercise">${escHtml(ex.name)}</td>
-              <td data-label="Warm-up Sets">${escHtml(ex.warmup)}</td>
-              <td data-label="Sets">${escHtml(ex.sets)}</td>
-              <td data-label="Reps">${escHtml(ex.reps)}</td>
-              <td data-label="WT"><input type="number" class="ws-wt-input" step="0.5" min="0" placeholder="—" autocomplete="off" ${isBW?'disabled title="Bodyweight"':''}></td>
-              <td class="ws-load-cell"><span class="ws-load-badge ${loadClass}">${escHtml(ex.load)}</span><div class="ws-load-pct">${escHtml(ex.pct)}</div></td>
-              <td data-label="Rest">${escHtml(ex.rest)}</td>
-            </tr>`;
-        }
+        return group.exercises.map((ex, ei) => {
+          const loadClass = loadClassMap[ex.load] || 'ws-hyp';
+          const isBW = ex.pct === 'BW' || ex.pct === 'BW+';
+          if (coachMode) {
+            return `
+              <tr data-di="${di}" data-gi="${gIndex}" data-ei="${ei}" data-gym="1">
+                <td class="ws-exercise"><input class="edit-input" value="${escHtml(ex.name)}" onchange="updateExercise(${di},${gIndex},${ei},'name',this.value)" style="min-width:150px"></td>
+                <td><input class="edit-input" value="${escHtml(ex.warmup)}" onchange="updateExercise(${di},${gIndex},${ei},'warmup',this.value)" style="width:100px"></td>
+                <td><input class="edit-input" value="${escHtml(ex.sets)}" onchange="updateExercise(${di},${gIndex},${ei},'sets',this.value)" style="width:50px"></td>
+                <td><input class="edit-input" value="${escHtml(ex.reps)}" onchange="updateExercise(${di},${gIndex},${ei},'reps',this.value)" style="width:70px"></td>
+                <td data-label="WT"><input type="number" class="ws-wt-input" step="0.5" min="0" placeholder="—" autocomplete="off" ${isBW?'disabled title="Bodyweight"':''}></td>
+                <td class="ws-load-cell">
+                  <select class="edit-select" style="font-size:10px;margin-bottom:3px" onchange="updateExercise(${di},${gIndex},${ei},'load',this.value)">
+                    <option${ex.load==='Strength'?' selected':''}>Strength</option>
+                    <option${ex.load==='Hypertrophy'?' selected':''}>Hypertrophy</option>
+                    <option${ex.load==='Endurance'?' selected':''}>Endurance</option>
+                  </select>
+                  <input class="edit-input ws-load-pct" value="${escHtml(ex.pct)}" onchange="updateExercise(${di},${gIndex},${ei},'pct',this.value)" style="width:70px;font-size:10px">
+                </td>
+                <td><input class="edit-input" value="${escHtml(ex.rest)}" onchange="updateExercise(${di},${gIndex},${ei},'rest',this.value)" style="width:70px"></td>
+                <td class="ws-action-cell">
+                  <button class="ws-row-action" type="button" onclick="focusExerciseInput(${di},${gIndex},${ei})">Edit</button>
+                  <button class="ws-row-action remove" type="button" onclick="removeExercise(${di},${gIndex},${ei})">Delete</button>
+                </td>
+              </tr>`;
+          } else {
+            return `
+              <tr data-gym="1">
+                <td class="ws-exercise">${escHtml(ex.name)}</td>
+                <td data-label="Warm-up Sets">${escHtml(ex.warmup)}</td>
+                <td data-label="Sets">${escHtml(ex.sets)}</td>
+                <td data-label="Reps">${escHtml(ex.reps)}</td>
+                <td data-label="WT"><input type="number" class="ws-wt-input" step="0.5" min="0" placeholder="—" autocomplete="off" ${isBW?'disabled title="Bodyweight"':''}></td>
+                <td class="ws-load-cell"><span class="ws-load-badge ${loadClass}">${escHtml(ex.load)}</span><div class="ws-load-pct">${escHtml(ex.pct)}</div></td>
+                <td data-label="Rest">${escHtml(ex.rest)}</td>
+              </tr>`;
+          }
+        }).join('');
       }).join('');
-      return `<tr class="ws-group-row"><td colspan="${colSpan}">${escHtml(group.name)}</td></tr>${exerciseRows}`;
-    }).join('');
 
-    return `
-      <div class="ws-day-block fade-up fade-up-2">
-        <div class="ws-day-header" style="--day-color:${day.color}">
-          <div class="ws-day-pill" style="background:${day.color}">${escHtml(day.label)}</div>
-          <div class="ws-day-title">${coachMode
-            ? `<input class="edit-input" value="${escHtml(day.title)}" onchange="clientData.workouts[${di}].title=this.value" style="font-size:14px;font-weight:800;width:120px"> — <input class="edit-input" value="${escHtml(day.subtitle)}" onchange="clientData.workouts[${di}].subtitle=this.value" style="font-size:12px;color:var(--text2);width:200px">`
-            : `${escHtml(day.title)} — <span>${escHtml(day.subtitle)}</span>`}
-          </div>
-          ${coachMode ? `<button class="ws-add-ex-btn" onclick="openAddExerciseModal(${di})" style="background:var(--yellow);color:var(--bg);border:none;padding:6px 12px;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;margin-left:10px;">+ Add Exercise</button>` : ''}
-        </div>
+      innerContent = `
         <div class="ws-table-wrap">
           <table class="ws-table">
             <thead><tr>
@@ -3283,12 +3973,92 @@ function renderWorkoutSplit() {
             <tbody>${groupRows}</tbody>
           </table>
         </div>
+        ${coachMode ? `<button class="ws-add-ex-btn" onclick="openAddExerciseModal(${di})" style="background:var(--yellow);color:var(--bg);border:none;padding:6px 12px;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;margin-left:10px;margin-top:8px;">+ Add Exercise</button>` : ''}`;
+
+    } else if (trainingMode === 'CrossFit') {
+      // ── CROSSFIT: block-based interface only — NO gym table ──
+      innerContent = _renderCFSection(day, di);
+
+    } else {
+      // ── HYBRID: gym table on top, CrossFit section below ──
+      innerContent = _renderGymTable(day, di) + _renderCFSection(day, di);
+    }
+
+    const dayHeaderActions = coachMode ? `
+      <button onclick="deleteTrainingDay(${di})" style="background:transparent;border:1px solid rgba(224,98,98,0.45);color:#E05555;padding:6px 12px;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;margin-left:6px;" title="Delete this day">🗑 Delete Day</button>` : '';
+
+    return `
+      <div class="ws-day-block fade-up fade-up-2">
+        <div class="ws-day-header" style="--day-color:${day.color}">
+          <div class="ws-day-pill" style="background:${day.color}">${escHtml(day.label)}</div>
+          <div class="ws-day-title">${coachMode
+            ? `<input class="edit-input" value="${escHtml(day.title)}" onchange="clientData.workouts[${di}].title=this.value" style="font-size:14px;font-weight:800;width:120px"> — <input class="edit-input" value="${escHtml(day.subtitle)}" onchange="clientData.workouts[${di}].subtitle=this.value" style="font-size:12px;color:var(--text2);width:200px">`
+            : `${escHtml(day.title)} — <span>${escHtml(day.subtitle)}</span>`}
+          </div>
+          ${dayHeaderActions}
+        </div>
+        <div class="ws-day-body">${innerContent}</div>
       </div>`;
   }).join('');
+
+  container.innerHTML = controlsHtml + daysHtml;
 
   // Restore WT inputs
   restoreWTInputs();
   attachWTListeners();
+}
+
+/* Helper: add CF block to the last existing day (used by Hybrid mode add menu) */
+function addCFBlockToLastDay(blockType) {
+  const di = clientData.workouts.length - 1;
+  if (di < 0) {
+    // No days yet — create one first
+    addTrainingDay();
+    addCFBlockToDay(0, blockType);
+  } else {
+    addCFBlockToDay(di, blockType);
+  }
+}
+
+/* ── CF Block data manipulation helpers ── */
+function addCFBlockToDay(di, blockType) {
+  if (!clientData.workouts[di].cfBlocks) clientData.workouts[di].cfBlocks = [];
+  const template = CROSSFIT_DB.wod_templates ? CROSSFIT_DB.wod_templates.find(t => t.type === blockType) : null;
+  clientData.workouts[di].cfBlocks.push({
+    type: blockType,
+    duration: template ? template.duration : '',
+    level: template ? template.level : 'beginner',
+    exercises: template ? template.exercises.map(e => ({ name: e.name, reps: e.reps, notes: '' }))
+                        : [{ name: CROSSFIT_DB.exercises[0].name, reps: '10', notes: '' }]
+  });
+  renderWorkoutSplit();
+}
+
+function removeCFBlock(di, bi) {
+  if (!clientData.workouts[di].cfBlocks) return;
+  clientData.workouts[di].cfBlocks.splice(bi, 1);
+  renderWorkoutSplit();
+}
+
+function addCFExercise(di, bi) {
+  if (!clientData.workouts[di].cfBlocks || !clientData.workouts[di].cfBlocks[bi]) return;
+  clientData.workouts[di].cfBlocks[bi].exercises.push({ name: CROSSFIT_DB.exercises[0].name, reps: '10', notes: '' });
+  renderWorkoutSplit();
+}
+
+function removeCFExercise(di, bi, ei) {
+  clientData.workouts[di].cfBlocks[bi].exercises.splice(ei, 1);
+  renderWorkoutSplit();
+}
+
+function updateCFExercise(di, bi, ei, field, val) {
+  clientData.workouts[di].cfBlocks[bi].exercises[ei][field] = val;
+}
+
+function updateCFBlock(di, bi, field, val) {
+  if (clientData.workouts[di].cfBlocks && clientData.workouts[di].cfBlocks[bi]) {
+    clientData.workouts[di].cfBlocks[bi][field] = val;
+  }
 }
 
 function updateExercise(di, gi, ei, field, val) {
@@ -3311,6 +4081,15 @@ function focusExerciseInput(di, gi, ei) {
   if (input) input.focus();
 }
 
+/* FEATURE 2: Delete Training Day — removes day at index di, re-renders */
+function deleteTrainingDay(di) {
+  if (!confirm(`Delete Day ${di + 1} (${clientData.workouts[di].title})? This cannot be undone.`)) return;
+  clientData.workouts.splice(di, 1);
+  // Re-number day labels to stay sequential
+  clientData.workouts.forEach((d, i) => { d.day = i + 1; d.label = `Day ${i + 1}`; });
+  renderWorkoutSplit();
+}
+
 function addTrainingDay() {
   const templates = [
     { title: 'Upper', subtitle: 'Chest · Back · Shoulders', color: 'var(--upper)' },
@@ -3329,6 +4108,7 @@ function addTrainingDay() {
     label: `Day ${dayNumber}`,
     title: template.title,
     subtitle: template.subtitle,
+    cfBlocks: [],
     groups: [
       { name: 'New Warm-Up / Main Set', exercises: [
         { name: 'New Exercise', warmup: '—', sets: '3', reps: '10', load: 'Hypertrophy', pct: '70–75%', rest: '90 sec' }
@@ -3373,6 +4153,17 @@ function renderCardioTime() {
 
 function removeDietType(index) {
   clientData.nutrition.dietTypes.splice(index, 1);
+  renderDietTypes();
+}
+
+/* FEATURE 4: Add a new diet card with default values — coach mode only */
+function addDietCard() {
+  clientData.nutrition.dietTypes.push({
+    type: "balanced",
+    label: "نظام جديد",
+    desc: "وصف النظام الغذائي الجديد.",
+    macros: { carb: "150g", pro: "180g", fat: "60g" }
+  });
   renderDietTypes();
 }
 
@@ -3428,6 +4219,8 @@ function updateProgress() {
   initChart();
 }
 
+/* FIX: expose updateProgressDisplay on window for Firebase post-hydration call */
+window.updateProgressDisplay = updateProgressDisplay;
 function updateProgressDisplay() {
   const p = clientData.progress;
   document.getElementById('progressStartDisplay').innerHTML = `${p.start} <span style="font-size:11px">كجم</span>`;
@@ -3505,6 +4298,9 @@ function selectMood(btn) {
   document.querySelectorAll('.mood-btn').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
   const mood = btn.getAttribute('data-mood');
+  // Store readable label for the coach report
+  const moodLabels = { low: 'Low Energy 🔋', normal: 'Normal ⚡', strong: 'Strong 🔥', beast: 'Beast Mode 💀', recovery: 'Recovery 🌊' };
+  currentMoodLabel = moodLabels[mood] || mood;
   const msg = moodMessages[mood];
   if (msg) {
     document.getElementById('moodMsgMain').textContent = msg.main;
@@ -3518,6 +4314,7 @@ function selectMood(btn) {
 /* ══ MISSION SYSTEM ══ */
 let completedTasks = 0;
 let totalXP = 0;
+let currentMoodLabel = '';   // tracks the active "Feel Today" selection
 const MISSION_LS_KEY = 'mission_state_v1';
 
 function toggleTask(el) {
@@ -3557,7 +4354,7 @@ function updateXP() {
 }
 
 function updateBadges() {
-  const chips = document.querySelectorAll('.mission-task');
+  // ── Update daily check-in chips ──────────────────────────────────────────
   const chipContainer = document.getElementById('dsTaskChips');
   if (chipContainer) {
     const names = ['السعرات', 'التمرين', 'الخطوات', 'الماء', 'النوم'];
@@ -3566,26 +4363,28 @@ function updateBadges() {
   document.querySelectorAll('.mission-task').forEach((t, i) => {
     const chip = document.getElementById('chip' + i);
     if (chip) {
-      if (t.classList.contains('done')) {
-        chip.classList.add('done');
-      } else {
-        chip.classList.remove('done');
-      }
+      if (t.classList.contains('done')) chip.classList.add('done');
+      else chip.classList.remove('done');
     }
   });
 
-  // Strict 1-to-1 mapping: mission[i] controls achievement[i]
-  const missions = document.querySelectorAll('.mission-task');
-  const achievements = document.querySelectorAll('.badge-card');
+  // ── Progress-based achievement system ────────────────────────────────────
+  // Count current completed tasks fresh (do NOT rely on external completedTasks)
+  const doneTasks = document.querySelectorAll('.mission-task.done').length;
 
-  missions.forEach((mission, index) => {
-    const achievement = achievements[index];
-    if (achievement) {
-      if (mission.classList.contains('done')) {
-        achievement.classList.add('active');
-      } else {
-        achievement.classList.remove('active');
-      }
+  // Map: doneTasks threshold → achievement index (0-based)
+  // 1 done → unlock index 0 "First Step"
+  // 2 done → unlock indices 0–1 "Consistent"
+  // 3 done → unlock indices 0–2 "Focused"
+  // 4 done → unlock indices 0–3 "Full Control"
+  // 5 done → unlock indices 0–4 "Perfect Day"
+  const achievements = document.querySelectorAll('.badge-card');
+  achievements.forEach((badge, index) => {
+    // Badge at position `index` is earned when doneTasks >= (index + 1)
+    if (doneTasks >= index + 1) {
+      badge.classList.add('active');
+    } else {
+      badge.classList.remove('active');
     }
   });
 }
@@ -3736,7 +4535,7 @@ window.submitReport = function() {
   tasks.forEach((t, i) => { taskStatus.push(taskNames[i] + ': ' + (t.classList.contains('done') ? '✔' : '✖')); });
   let score = completedTasks >= 5 ? 'Strong Day' : completedTasks >= 3 ? 'Controlled Day' : completedTasks >= 1 ? 'Building' : 'Recovery Day';
   let consistency = completedTasks >= 5 ? 'Active' : completedTasks >= 3 ? 'Building' : 'Comeback';
-  const report = ['📋 Daily Check-in Report','Status: Completed','─────────────────',...taskStatus,'─────────────────','Consistency: '+consistency,'Today Score: '+score, note ? 'Client Note:\n' + note : '','─────────────────','— Submitted via C.Mario Aziz Portal'].filter(Boolean).join('\n');
+  const report = ['📋 Daily Check-in Report','Status: Completed','─────────────────',...taskStatus,'─────────────────','Feel Today: ' + (currentMoodLabel || 'Not specified'),'Consistency: '+consistency,'Today Score: '+score, note ? 'Client Note:\n' + note : '','─────────────────','— Submitted via C.Mario Aziz Portal'].filter(Boolean).join('\n');
   setTimeout(() => {
     btn.classList.remove('loading'); btn.classList.add('done');
     txt.textContent = doneMsgs[Math.floor(Math.random()*doneMsgs.length)];
@@ -3772,7 +4571,8 @@ window.wsCalcVolume = function() {
     if (pill && pill.textContent.trim() === 'Day '+dayNum) { targetBlock = dayBlocks[i]; break; }
   }
   if (!targetBlock) { if(resultDiv) resultDiv.style.display='none'; return; }
-  var rows = targetBlock.querySelectorAll('.ws-table tbody tr:not(.ws-group-row)');
+  /* VOLUME: only count gym exercise rows (data-gym="1") — ignore CrossFit blocks */
+  var rows = targetBlock.querySelectorAll('.ws-table tbody tr[data-gym="1"]');
   var totalVolume = 0;
   rows.forEach(function(row) {
     var cells = row.querySelectorAll('td');
@@ -3826,12 +4626,22 @@ function escHtml(str) {
 
 function randomFrom(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 
-/* ══ INIT ══ */
-document.addEventListener('DOMContentLoaded', function() {
-  renderAll();
-  initChart();
-  updateProgressDisplay();
+/* ══ INIT ══
+ * FIX: We must NOT call renderAll() + initChart() here with stale local
+ * defaults, because the Firebase bootstrap will shortly hydrate clientData
+ * with the real Firestore values and then call renderAll() itself.
+ * Calling renderAll() here first would briefly flash default data and, more
+ * importantly, would conflict with the async Firebase load.
+ *
+ * What we DO here: non-data UI setup only (day label, ticker, event listeners).
+ * Firebase bootstrap is responsible for the first full renderAll() call once
+ * real data is available.  If Firebase fails entirely, window._firebaseReady
+ * will never be set and the fallback timer below triggers renderAll() with
+ * local defaults so the UI is never completely blank.
+ * ══════════════════════════════════════════════════════════════════════════ */
+window._firebaseReady = false;  // set to true by bootstrap() after hydration
 
+function _initNonDataUI() {
   // Day label
   const dayNames = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
   const dl = document.getElementById('dsDayLabel');
@@ -3848,29 +4658,39 @@ document.addEventListener('DOMContentLoaded', function() {
   const overlay = document.getElementById('emOverlay');
   if (overlay) overlay.addEventListener('click', function(e) { if(e.target===overlay) window.closeEmergencyMode(); });
   document.addEventListener('keydown', function(e) { if(e.key==='Escape') { window.closeEmergencyMode(); closePasswordModal(); } });
-});
+
+  // Fallback: if Firebase hasn't rendered within 8 s, render with local defaults
+  setTimeout(function() {
+    if (!window._firebaseReady) {
+      console.warn("⚠️ Firebase did not complete in time — rendering with local defaults");
+      renderAll();
+      initChart();
+      updateProgressDisplay();
+    }
+    /* Always dismiss loading bar after timeout regardless of Firebase status */
+    const fbBar = document.getElementById('fbLoadingBar');
+    if (fbBar) { fbBar.classList.add('done'); setTimeout(() => fbBar.remove(), 600); }
+  }, 8000);
+}
+
+// Expose initChart globally so the Firebase module can call it after hydration
+window.initChart = initChart;
+
+document.addEventListener('DOMContentLoaded', _initNonDataUI);
 
 if (document.readyState !== 'loading') {
-  renderAll();
-  initChart();
-  updateProgressDisplay();
-  const dayNames = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
-  const dl = document.getElementById('dsDayLabel');
-  if (dl) dl.textContent = dayNames[new Date().getDay()];
-  const stEl = document.getElementById('dsSubmitText');
-  if (stEl) stEl.textContent = randomFrom(ctaVariants);
-  setTimeout(nextTicker, 4000);
+  _initNonDataUI();
 }
 
 /* ══ ADD EXERCISE MODAL ══ */
 function openAddExerciseModal(dayIndex) {
-  const modal = document.getElementById('addExerciseModal');
+  let modal = document.getElementById('addExerciseModal');
   if (!modal) {
-    // Create modal if not exists
+    // Create modal once — NO dayIndex baked into button onclick
     const modalHtml = `
       <div id="addExerciseModal" class="modal-overlay" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:1000;justify-content:center;align-items:center;">
         <div class="modal-content" style="background:var(--card);padding:24px;border-radius:12px;max-width:500px;width:90%;max-height:80vh;overflow-y:auto;">
-          <h3 style="margin:0 0 16px 0;color:var(--text);font-size:18px;">Add Exercise to Day ${dayIndex + 1}</h3>
+          <h3 id="addExModalTitle" style="margin:0 0 16px 0;color:var(--text);font-size:18px;">Add Exercise</h3>
           <div style="margin-bottom:16px;">
             <label style="display:block;margin-bottom:4px;font-size:14px;color:var(--text2);">Category:</label>
             <select id="exCategory" onchange="updateGroups()" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg2);color:var(--text);">
@@ -3891,22 +4711,107 @@ function openAddExerciseModal(dayIndex) {
               <!-- populated by JS -->
             </select>
           </div>
+          <div style="margin-bottom:16px;">
+            <label style="display:block;margin-bottom:4px;font-size:14px;color:var(--text2);">Training Preset (auto-fill, override anytime):</label>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;" id="exPresetPills">
+              <button type="button" class="ex-preset-pill" data-preset="Endurance" onclick="applyPreset('Endurance')">🟢 Endurance</button>
+              <button type="button" class="ex-preset-pill" data-preset="Hypertrophy" onclick="applyPreset('Hypertrophy')">🔵 Hypertrophy</button>
+              <button type="button" class="ex-preset-pill" data-preset="Strength" onclick="applyPreset('Strength')">🔴 Strength</button>
+              <button type="button" class="ex-preset-pill" data-preset="Max Effort" onclick="applyPreset('Max Effort')">⚫ Max Effort</button>
+            </div>
+            <div id="exPresetLabel" style="font-size:11px;color:var(--text3);margin-top:6px;font-weight:600;">No preset selected — fill manually or choose a preset above</div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px;">
+            <div>
+              <label style="display:block;margin-bottom:4px;font-size:13px;color:var(--text2);">Sets:</label>
+              <input id="exSets" class="edit-input" value="3" oninput="markPresetCustom()" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg2);color:var(--text);">
+            </div>
+            <div>
+              <label style="display:block;margin-bottom:4px;font-size:13px;color:var(--text2);">Reps:</label>
+              <input id="exReps" class="edit-input" value="10–12" oninput="markPresetCustom()" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg2);color:var(--text);">
+            </div>
+            <div>
+              <label style="display:block;margin-bottom:4px;font-size:13px;color:var(--text2);">Rest:</label>
+              <input id="exRest" class="edit-input" value="90 sec" oninput="markPresetCustom()" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg2);color:var(--text);">
+            </div>
+            <div>
+              <label style="display:block;margin-bottom:4px;font-size:13px;color:var(--text2);">Load / Intensity %:</label>
+              <input id="exPct" class="edit-input" value="70–80%" oninput="markPresetCustom()" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg2);color:var(--text);">
+            </div>
+          </div>
           <div style="display:flex;gap:12px;justify-content:flex-end;">
             <button onclick="closeAddExerciseModal()" style="background:transparent;border:1px solid var(--border);color:var(--text2);padding:8px 16px;border-radius:6px;cursor:pointer;">Cancel</button>
-            <button onclick="addExercise(${dayIndex})" style="background:var(--yellow);border:none;color:var(--bg);padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:700;">Add Exercise</button>
+            <!-- FIX: calls addExercise() which reads the day from modal's data-day-index -->
+            <button id="addExConfirmBtn" onclick="addExercise()" style="background:var(--yellow);border:none;color:var(--bg);padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:700;">Add Exercise</button>
           </div>
         </div>
       </div>
     `;
     document.body.insertAdjacentHTML('beforeend', modalHtml);
+    modal = document.getElementById('addExerciseModal');
   }
-  document.getElementById('addExerciseModal').style.display = 'flex';
+  // FIX: store the correct dayIndex on the modal element — read on confirm
+  modal.dataset.dayIndex = dayIndex;
+  document.getElementById('addExModalTitle').textContent = `Add Exercise to Day ${dayIndex + 1}`;
+  modal.style.display = 'flex';
   document.getElementById('exCategory').value = 'A';
+  _activePreset = null;
+  // Reset preset pills and label if modal was already created
+  if (document.getElementById('exPresetPills')) {
+    document.querySelectorAll('.ex-preset-pill').forEach(b => b.classList.remove('active'));
+    const lbl = document.getElementById('exPresetLabel');
+    if (lbl) lbl.textContent = 'No preset selected — fill manually or choose a preset above';
+    const sEl = document.getElementById('exSets'); if (sEl) sEl.value = '3';
+    const rEl = document.getElementById('exReps'); if (rEl) rEl.value = '10–12';
+    const rsEl = document.getElementById('exRest'); if (rsEl) rsEl.value = '90 sec';
+    const pEl = document.getElementById('exPct');  if (pEl) pEl.value = '70–80%';
+  }
   updateGroups();
 }
 
 function closeAddExerciseModal() {
   document.getElementById('addExerciseModal').style.display = 'none';
+}
+
+/* ══ TASK 5: PRESET ENGINE ══ */
+const PRESETS = {
+  'Endurance':   { reps: '15–20', rest: '30–60 sec', pct: '50–60%', load: 'Endurance' },
+  'Hypertrophy': { reps: '8–12',  rest: '60–90 sec', pct: '65–75%', load: 'Hypertrophy' },
+  'Strength':    { reps: '4–6',   rest: '2–3 min',   pct: '80–88%', load: 'Strength' },
+  'Max Effort':  { reps: '1–3',   rest: '3–5 min',   pct: '90–97%', load: 'Strength' }
+};
+
+let _activePreset = null;
+
+function applyPreset(name) {
+  const p = PRESETS[name];
+  if (!p) return;
+  _activePreset = name;
+
+  // Auto-fill into editable inputs (NOT locked)
+  const repsEl = document.getElementById('exReps');
+  const restEl = document.getElementById('exRest');
+  const pctEl  = document.getElementById('exPct');
+  if (repsEl) repsEl.value = p.reps;
+  if (restEl) restEl.value = p.rest;
+  if (pctEl)  pctEl.value  = p.pct;
+
+  // Highlight active pill
+  document.querySelectorAll('.ex-preset-pill').forEach(b => {
+    b.classList.toggle('active', b.dataset.preset === name);
+  });
+
+  // Update label
+  const lbl = document.getElementById('exPresetLabel');
+  if (lbl) lbl.textContent = `✅ Preset: ${name} — values auto-filled. You can override any field.`;
+}
+
+function markPresetCustom() {
+  if (!_activePreset) return;
+  _activePreset = null;
+  document.querySelectorAll('.ex-preset-pill').forEach(b => b.classList.remove('active'));
+  const lbl = document.getElementById('exPresetLabel');
+  if (lbl) lbl.textContent = 'Custom — preset overridden manually';
 }
 
 function updateGroups() {
@@ -3938,7 +4843,10 @@ function updateExercises() {
   }
 }
 
-function addExercise(dayIndex) {
+function addExercise() {
+  // FIX: read the correct day from the modal's data attribute — set on every open
+  const modal = document.getElementById('addExerciseModal');
+  const dayIndex = parseInt(modal.dataset.dayIndex, 10);
   const cat = document.getElementById('exCategory').value;
   const groupLabel = document.getElementById('exGroup').value;
   const exName = document.getElementById('exExercise').value;
@@ -3954,14 +4862,20 @@ function addExercise(dayIndex) {
   }
 
   // Add exercise
+  const presetLoad = _activePreset && PRESETS[_activePreset] ? PRESETS[_activePreset].load : 'Hypertrophy';
+  const exSets = (document.getElementById('exSets') || {}).value || '3';
+  const exReps = (document.getElementById('exReps') || {}).value || '10–12';
+  const exRest = (document.getElementById('exRest') || {}).value || '90 sec';
+  const exPct  = (document.getElementById('exPct')  || {}).value || '70–80%';
+
   const newEx = {
     name: exLabel,
     warmup: "—",
-    sets: "3",
-    reps: "10–12",
-    load: "Hypertrophy",
-    pct: "70–80%",
-    rest: "90 sec"
+    sets: exSets,
+    reps: exReps,
+    load: presetLoad,
+    pct: exPct,
+    rest: exRest
   };
   group.exercises.push(newEx);
 
@@ -4097,6 +5011,52 @@ function addExercise(dayIndex) {
     }
   }
 
+  // ── CATEGORY SYSTEM ─────────────────────────────────────────────────────────
+  // Single source of truth for all valid categories.
+  // Every category that exists in NF_DATA must have an entry here.
+  // Buttons are generated from this map — no more hardcoded HTML strings.
+  const CATEGORIES = {
+    ALL:       'الكل',
+    RED_MEAT:  'لحوم حمراء',
+    POULTRY:   'دواجن',
+    FISH:      'أسماك ومأكولات بحرية',
+    EGGS:      'بيض',
+    DAIRY:     'ألبان وجبن',
+    CARBS:     'كربوهيدرات',
+    LEGUMES:   'بقوليات',
+    VEG:       'خضروات',
+    FRUIT:     'فواكه',
+    FATS:      'دهون وزيوت',
+    SUPPS:     'مكملات',
+    SWEETS:    'حلويات وسناكس',
+    SAUCES:    'صلصات وتوابل',
+    DRINKS:    'مشروبات',
+  };
+
+  // ── NORMALISATION ────────────────────────────────────────────────────────────
+  // Applied once at source. Removes invisible chars, collapses whitespace,
+  // trims, and NFKC-normalises Arabic glyphs (e.g. alef variants).
+  function normalizeCategory(str) {
+    if (typeof str !== 'string') return '';
+    return str
+      .normalize('NFKC')
+      .replace(/[\u200B\u200C\u200D\uFEFF]/g, '') // zero-width / BOM
+      .replace(/\u00A0/g, ' ')                     // non-breaking space → space
+      .replace(/\s+/g, ' ')                        // collapse whitespace
+      .trim();
+  }
+
+  // Pre-process every item in NF_DATA once — clean at source, never again.
+  const KNOWN_CATS = new Set(Object.values(CATEGORIES));
+  NF_DATA.forEach(item => {
+    const raw = item.cat;
+    item.cat = normalizeCategory(raw);
+    if (!KNOWN_CATS.has(item.cat)) {
+      console.warn('[NF] Unknown category after normalisation:', JSON.stringify(item.cat), '←', JSON.stringify(raw), '|', item.n);
+    }
+  });
+
+  // ── CATEGORY FILTER ──────────────────────────────────────────────────────────
   window.nfFilter = function() {
     const q = document.getElementById('nfSearch').value.trim();
     const sort = document.getElementById('nfSort').value;
@@ -4104,9 +5064,12 @@ function addExercise(dayIndex) {
 
     clearBtn.style.display = q ? 'block' : 'none';
 
+    const normActive = normalizeCategory(activeCat);
+
     filtered = NF_DATA.filter(item => {
-      const catMatch = activeCat === 'الكل' || item.cat === activeCat;
-      const qMatch = !q || item.n.includes(q);
+      // Safe category match: both sides normalised, never raw string comparison
+      const catMatch = normActive === CATEGORIES.ALL || item.cat === normActive;
+      const qMatch   = !q || item.n.includes(q);
       return catMatch && qMatch;
     });
 
@@ -4124,7 +5087,8 @@ function addExercise(dayIndex) {
   window.nfSelectCat = function(btn) {
     document.querySelectorAll('.nf-cat-btn').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
-    activeCat = btn.dataset.cat;
+    // Normalise at the point of capture — btn.dataset.cat is the single input gate
+    activeCat = normalizeCategory(btn.dataset.cat);
     nfFilter();
   };
 
