@@ -12824,143 +12824,166 @@ function addExercise() {
 })();
 </script>
 
-<!-- ══════════════════════════════════════════════════════════════════
-     FALCFIT — REMOTE CONFIG LAYER (nour-cae47)
-     ─ COMPLETELY ISOLATED — does NOT touch existing Firebase init
-     ─ Uses static top-level imports (same SDK version already loaded)
-     ─ Named app "falcfit-config" avoids collision with unnamed app
-     ─ Syncs window.APP_CONFIG from Firestore config/main
-     ─ Controls intro screen visibility via shouldShowIntro()
-     ═══════════════════════════════════════════════════════════════════ -->
-<script type="module">
-  // ── Static top-level imports — reuses the same SDK already fetched above,
-  //    no extra network request, no dynamic-import fetch errors.
-  import { initializeApp, getApps }
-    from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-  import { getFirestore, doc, onSnapshot }
-    from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+<!-- ████████████████████████████████████████████████████████████████████
+     FALCFIT — CONFIG LAYER  (single-source edition)
+     ────────────────────────────────────────────────────────────────────
+     SINGLE SOURCE OF TRUTH: the ONE firebaseConfig block at the top.
+     ─ No second Firebase project.
+     ─ No second initializeApp().
+     ─ No extra SDK imports or CDN fetches.
+     ─ No new Firestore listeners.
 
-  // ── Step 1: Safe APP_CONFIG default (never overwrites if already set) ──
-  window.APP_CONFIG = window.APP_CONFIG || {
-    featureFlags: {},
-    ui: {},
-    intro: {
-      enabled: true,
-      mode: "daily",
-      duration: 4000
-    }
-  };
+     HOW IT WORKS:
+       The existing onSnapshot on app/main already calls _hydrateAll(remote)
+       on every update.  We wrap that function so it also reads
+       remote.config → window.APP_CONFIG after the original logic runs.
 
-  // ── Step 2: Feature control function (pure logic, no side effects) ──
-  window.shouldShowIntro = function shouldShowIntro() {
+     TO CONTROL THE APP FROM FIREBASE:
+       In your Firestore document  app / main  add a  config  sub-key:
+       {
+         system: { … },   ← untouched (coach data)
+         user:   { … },   ← untouched (client data)
+         meta:   { … },   ← untouched (control engine)
+         config: {         ← NEW — only this layer reads it
+           intro: {
+             enabled:  true,
+             mode:     "daily",   // "always" | "once" | "daily"
+             duration: 4000
+           },
+           featureFlags: {},
+           ui: {}
+         }
+       }
+     ████████████████████████████████████████████████████████████████████ -->
+
+<!-- BLOCK 1 — Default config (available instantly, before Firebase responds) -->
+<script>
+window.APP_CONFIG = window.APP_CONFIG || {
+  featureFlags: {},
+  ui:           {},
+  intro: {
+    enabled:  true,
+    mode:     "daily",
+    duration: 4000
+  }
+};
+</script>
+
+<!-- BLOCK 2 — Sync engine: wraps _hydrateAll to extract remote.config sub-key -->
+<script>
+(function () {
+  "use strict";
+
+  /* ── Apply config sub-key from any Firestore snapshot ── */
+  function _applyConfig(remote) {
     try {
-      const config = window.APP_CONFIG && window.APP_CONFIG.intro;
-      if (!config || !config.enabled) return false;
-      const now  = Date.now();
-      const last = localStorage.getItem("intro_last_seen");
-      if (config.mode === "always") return true;
-      if (config.mode === "once") {
-        if (!localStorage.getItem("intro_seen")) {
-          localStorage.setItem("intro_seen", "1");
-          return true;
-        }
-        return false;
-      }
-      if (config.mode === "daily") {
-        const isNewDay =
-          !last ||
-          new Date(+last).toDateString() !== new Date(now).toDateString();
-        if (isNewDay) {
-          localStorage.setItem("intro_last_seen", String(now));
-          return true;
-        }
-        return false;
-      }
-    } catch (e) {
-      console.warn("[APP_CONFIG] shouldShowIntro error:", e);
-    }
-    return false;
-  };
+      var rc = (remote && remote.config) ? remote.config : {};
 
-  // ── Step 3: Safe DOM control — intro visibility on DOMContentLoaded ──
-  document.addEventListener("DOMContentLoaded", () => {
-    try {
-      const intro = document.getElementById("intro");
-      if (intro && !window.shouldShowIntro()) {
-        intro.style.display = "none";
-      }
-    } catch (e) {
-      console.warn("[APP_CONFIG] DOM intro control error:", e);
-    }
-  });
+      window.APP_CONFIG = Object.assign({}, window.APP_CONFIG, rc, {
+        intro: Object.assign(
+          {},
+          (window.APP_CONFIG && window.APP_CONFIG.intro) || {},
+          (rc && rc.intro) ? rc.intro : {}
+        ),
+        featureFlags: Object.assign(
+          {},
+          (window.APP_CONFIG && window.APP_CONFIG.featureFlags) || {},
+          (rc && rc.featureFlags) ? rc.featureFlags : {}
+        ),
+        ui: Object.assign(
+          {},
+          (window.APP_CONFIG && window.APP_CONFIG.ui) || {},
+          (rc && rc.ui) ? rc.ui : {}
+        )
+      });
 
-  // ── Step 4: Second isolated Firebase app for remote config ──
-  //    Named "falcfit-config" — prevents any collision with the
-  //    existing unnamed app (clients-9fa3e) already initialized above.
-  try {
-    const CONFIG_FIREBASE = {
-      apiKey:            "AIzaSyBBbNmCjnix8AHviQ45LqG_AisVQFChYHo",
-      authDomain:        "nour-cae47.firebaseapp.com",
-      projectId:         "nour-cae47",
-      storageBucket:     "nour-cae47.firebasestorage.app",
-      messagingSenderId: "329320657443",
-      appId:             "1:329320657443:web:d7e8d71976c8c08dc63796"
+      window.dispatchEvent(new CustomEvent("app_config_updated", {
+        detail: { config: window.APP_CONFIG }
+      }));
+
+      console.log("[CONFIG] ✅ Synced from app/main →", window.APP_CONFIG);
+    } catch (err) {
+      console.error("[CONFIG] Sync error:", err);
+    }
+  }
+
+  /* ── Wrap _hydrateAll — call original first, then read config sub-key ── */
+  function _patch() {
+    if (typeof window._hydrateAll !== "function") return false;
+
+    var _orig = window._hydrateAll;
+    window._hydrateAll = function (remote) {
+      _orig(remote);         /* ← existing system/user/meta logic — untouched */
+      _applyConfig(remote);  /* ← config sub-key read AFTER, no collision      */
     };
 
-    // Guard: reuse named instance if already created (safe on any reload/HMR)
-    const configApp =
-      getApps().find(a => a.name === "falcfit-config") ||
-      initializeApp(CONFIG_FIREBASE, "falcfit-config");
-
-    console.log("✅ [APP_CONFIG] Config Firebase initialized — project:", CONFIG_FIREBASE.projectId);
-
-    const configDb  = getFirestore(configApp);
-    const configRef = doc(configDb, "config", "main");
-
-    // ── Step 5: Real-time sync engine ──
-    onSnapshot(
-      configRef,
-      (snapshot) => {
-        try {
-          if (!snapshot.exists()) {
-            console.log("[APP_CONFIG] config/main not found — using defaults");
-            return;
-          }
-          // Shallow-merge: remote values win, existing defaults preserved for missing keys
-          window.APP_CONFIG = {
-            ...window.APP_CONFIG,
-            ...snapshot.data()
-          };
-          // Notify any listeners
-          window.dispatchEvent(new Event("app_config_updated"));
-
-          // Re-apply intro visibility whenever config changes remotely
-          try {
-            const intro = document.getElementById("intro");
-            if (intro) {
-              intro.style.display = window.shouldShowIntro() ? "" : "none";
-            }
-          } catch (domErr) {
-            console.warn("[APP_CONFIG] intro re-apply error:", domErr);
-          }
-
-          console.log("🔄 [APP_CONFIG] Remote config synced:", new Date().toLocaleTimeString());
-        } catch (mergeErr) {
-          console.error("[APP_CONFIG] Merge error:", mergeErr);
-        }
-      },
-      (err) => {
-        console.error("[APP_CONFIG] onSnapshot error:", err);
-      }
-    );
-
-    console.log("📡 [APP_CONFIG] Real-time config sync ACTIVE — config/main");
-
-  } catch (err) {
-    console.error("[APP_CONFIG] Firebase sync error:", err);
+    console.log("[CONFIG] ✅ _hydrateAll patched — single-source sync active");
+    return true;
   }
+
+  /* _hydrateAll lives inside a <script type="module"> so poll briefly */
+  if (!_patch()) {
+    var _n = 0;
+    var _t = setInterval(function () {
+      if (_patch() || ++_n >= 30) {
+        clearInterval(_t);
+        if (_n >= 30) console.warn("[CONFIG] _hydrateAll not ready — config sync skipped");
+      }
+    }, 200);
+  }
+
+})();
 </script>
-<!-- ══ END REMOTE CONFIG LAYER ══ -->
+
+<!-- BLOCK 3 — Feature gate + DOM control -->
+<script>
+/* shouldShowIntro — reads window.APP_CONFIG.intro, no external deps */
+window.shouldShowIntro = function () {
+  try {
+    var cfg  = window.APP_CONFIG && window.APP_CONFIG.intro;
+    if (!cfg || cfg.enabled === false) return false;
+    var mode = cfg.mode || "daily";
+    var now  = Date.now();
+    var last = localStorage.getItem("falc_intro_last");
+
+    if (mode === "always") return true;
+
+    if (mode === "once") {
+      if (!localStorage.getItem("falc_intro_seen")) {
+        localStorage.setItem("falc_intro_seen", "1");
+        return true;
+      }
+      return false;
+    }
+
+    if (mode === "daily") {
+      var newDay = !last ||
+        new Date(+last).toDateString() !== new Date(now).toDateString();
+      if (newDay) { localStorage.setItem("falc_intro_last", String(now)); return true; }
+      return false;
+    }
+
+  } catch (e) { console.error("[CONFIG] shouldShowIntro:", e); }
+  return true; /* fail-open */
+};
+
+/* DOM — hide intro on load if gate says no */
+document.addEventListener("DOMContentLoaded", function () {
+  try {
+    var el = document.getElementById("intro");
+    if (el && !window.shouldShowIntro()) el.style.display = "none";
+  } catch (e) { console.error("[CONFIG] DOM control:", e); }
+});
+
+/* Re-evaluate intro whenever remote config updates */
+window.addEventListener("app_config_updated", function () {
+  try {
+    var el = document.getElementById("intro");
+    if (el && !window.shouldShowIntro()) el.style.display = "none";
+  } catch (e) { console.error("[CONFIG] app_config_updated:", e); }
+});
+</script>
+<!-- ════ END CONFIG LAYER ════ -->
 
 </body>
 </html>
