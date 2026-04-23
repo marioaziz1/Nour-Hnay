@@ -71,21 +71,39 @@ service cloud.firestore {
    *    Swap firebaseConfig → different client, zero data collision.
    * ════════════════════════════════════════════════════════════════ */
   const firebaseConfig = {
-    apiKey:            "AIzaSyAFULyjr7x0YeHcFe8WIuOEj7iHwv2Fxio",
-    authDomain:        "clients-9fa3e.firebaseapp.com",
-    projectId:         "clients-9fa3e",
-    storageBucket:     "clients-9fa3e.firebasestorage.app",
-    messagingSenderId: "215918521741",
-    appId:             "1:215918521741:web:ef560210f1181e68b021c4"
+    apiKey: "AIzaSyBBbNmCjnix8AHviQ45LqG_AisVQFChYHo",
+    authDomain: "nour-cae47.firebaseapp.com",
+    projectId: "nour-cae47",
+    storageBucket: "nour-cae47.firebasestorage.app",
+    messagingSenderId: "329320657443",
+    appId: "1:329320657443:web:d7e8d71976c8c08dc63796"
   };
+  console.log("Connected to project:", firebaseConfig.projectId);
   /* ════════════════════════════════════════════════════════════════ */
 
-  const _app = initializeApp(firebaseConfig);
-  const db   = getFirestore(_app);
-  console.log("✅ Firebase initialized — project:", firebaseConfig.projectId);
+  // ── ADDED: config validation guard ──
+  function isFirebaseConfigured(config) {
+    return (
+      config &&
+      config.projectId &&
+      config.projectId !== "REPLACE_ME"
+    );
+  }
+
+  // ── ADDED: conditional initialization ──
+  let db = null;
+
+  if (isFirebaseConfigured(firebaseConfig)) {
+    const _app = initializeApp(firebaseConfig);
+    db = getFirestore(_app);
+    console.log("✅ Firebase initialized — project:", firebaseConfig.projectId);
+  } else {
+    console.warn("⚠️ Firebase not configured. Running in template mode.");
+  }
 
   /* ── Single document reference — no CLIENT_ID, no collection per client ── */
-  const DOC_REF = doc(db, "app", "main");
+  // ── ADDED: only create DOC_REF when db is available ──
+  const DOC_REF = db ? doc(db, "app", "main") : null;
 
   /* ════════════════════════════════════════════════
      GLOBAL STATE — three isolated namespaces
@@ -101,6 +119,8 @@ service cloud.firestore {
 
   /** Coach only — writes to system namespace */
   window.updateSystem = async function(data) {
+    // ── ADDED: block write if Firebase not configured ──
+    if (!db) { console.warn("Blocked write: Firebase not connected."); return; }
     try {
       await setDoc(DOC_REF, { system: { ...data, _updatedAt: serverTimestamp() } }, { merge: true });
       console.log("✅ [system] write OK:", new Date().toLocaleTimeString());
@@ -112,6 +132,8 @@ service cloud.firestore {
 
   /** Client only — appends to user namespace (NEVER overwrites previous days) */
   window.updateUser = async function(data) {
+    // ── ADDED: block write if Firebase not configured ──
+    if (!db) { console.warn("Blocked write: Firebase not connected."); return; }
     try {
       // Deep merge into user — append-only for dailyLogs and weightHistory
       await setDoc(DOC_REF, { user: data }, { merge: true });
@@ -124,6 +146,8 @@ service cloud.firestore {
 
   /** System only — writes meta control data */
   window.updateMeta = async function(data) {
+    // ── ADDED: block write if Firebase not configured ──
+    if (!db) { console.warn("Blocked write: Firebase not connected."); return; }
     try {
       await setDoc(DOC_REF, { meta: { ...data } }, { merge: true });
       console.log("✅ [meta] write OK:", new Date().toLocaleTimeString());
@@ -245,6 +269,12 @@ service cloud.firestore {
      BOOTSTRAP — getDoc once → create if missing → onSnapshot
   ════════════════════════════════════════════════ */
   async function bootstrap() {
+    // ── ADDED: skip all Firebase operations if not configured ──
+    if (!db) {
+      console.warn("⚠️ Bootstrap skipped — Firebase not configured (template mode).");
+      window._firebaseReady = false;
+      return;
+    }
     try {
       const snap  = await getDoc(DOC_REF);
       const fbBar = document.getElementById('fbLoadingBar');
@@ -12823,167 +12853,5 @@ function addExercise() {
   }, 600);
 })();
 </script>
-
-<!-- ████████████████████████████████████████████████████████████████████
-     FALCFIT — CONFIG LAYER  (single-source edition)
-     ────────────────────────────────────────────────────────────────────
-     SINGLE SOURCE OF TRUTH: the ONE firebaseConfig block at the top.
-     ─ No second Firebase project.
-     ─ No second initializeApp().
-     ─ No extra SDK imports or CDN fetches.
-     ─ No new Firestore listeners.
-
-     HOW IT WORKS:
-       The existing onSnapshot on app/main already calls _hydrateAll(remote)
-       on every update.  We wrap that function so it also reads
-       remote.config → window.APP_CONFIG after the original logic runs.
-
-     TO CONTROL THE APP FROM FIREBASE:
-       In your Firestore document  app / main  add a  config  sub-key:
-       {
-         system: { … },   ← untouched (coach data)
-         user:   { … },   ← untouched (client data)
-         meta:   { … },   ← untouched (control engine)
-         config: {         ← NEW — only this layer reads it
-           intro: {
-             enabled:  true,
-             mode:     "daily",   // "always" | "once" | "daily"
-             duration: 4000
-           },
-           featureFlags: {},
-           ui: {}
-         }
-       }
-     ████████████████████████████████████████████████████████████████████ -->
-
-<!-- BLOCK 1 — Default config (available instantly, before Firebase responds) -->
-<script>
-window.APP_CONFIG = window.APP_CONFIG || {
-  featureFlags: {},
-  ui:           {},
-  intro: {
-    enabled:  true,
-    mode:     "daily",
-    duration: 4000
-  }
-};
-</script>
-
-<!-- BLOCK 2 — Sync engine: wraps _hydrateAll to extract remote.config sub-key -->
-<script>
-(function () {
-  "use strict";
-
-  /* ── Apply config sub-key from any Firestore snapshot ── */
-  function _applyConfig(remote) {
-    try {
-      var rc = (remote && remote.config) ? remote.config : {};
-
-      window.APP_CONFIG = Object.assign({}, window.APP_CONFIG, rc, {
-        intro: Object.assign(
-          {},
-          (window.APP_CONFIG && window.APP_CONFIG.intro) || {},
-          (rc && rc.intro) ? rc.intro : {}
-        ),
-        featureFlags: Object.assign(
-          {},
-          (window.APP_CONFIG && window.APP_CONFIG.featureFlags) || {},
-          (rc && rc.featureFlags) ? rc.featureFlags : {}
-        ),
-        ui: Object.assign(
-          {},
-          (window.APP_CONFIG && window.APP_CONFIG.ui) || {},
-          (rc && rc.ui) ? rc.ui : {}
-        )
-      });
-
-      window.dispatchEvent(new CustomEvent("app_config_updated", {
-        detail: { config: window.APP_CONFIG }
-      }));
-
-      console.log("[CONFIG] ✅ Synced from app/main →", window.APP_CONFIG);
-    } catch (err) {
-      console.error("[CONFIG] Sync error:", err);
-    }
-  }
-
-  /* ── Wrap _hydrateAll — call original first, then read config sub-key ── */
-  function _patch() {
-    if (typeof window._hydrateAll !== "function") return false;
-
-    var _orig = window._hydrateAll;
-    window._hydrateAll = function (remote) {
-      _orig(remote);         /* ← existing system/user/meta logic — untouched */
-      _applyConfig(remote);  /* ← config sub-key read AFTER, no collision      */
-    };
-
-    console.log("[CONFIG] ✅ _hydrateAll patched — single-source sync active");
-    return true;
-  }
-
-  /* _hydrateAll lives inside a <script type="module"> so poll briefly */
-  if (!_patch()) {
-    var _n = 0;
-    var _t = setInterval(function () {
-      if (_patch() || ++_n >= 30) {
-        clearInterval(_t);
-        if (_n >= 30) console.warn("[CONFIG] _hydrateAll not ready — config sync skipped");
-      }
-    }, 200);
-  }
-
-})();
-</script>
-
-<!-- BLOCK 3 — Feature gate + DOM control -->
-<script>
-/* shouldShowIntro — reads window.APP_CONFIG.intro, no external deps */
-window.shouldShowIntro = function () {
-  try {
-    var cfg  = window.APP_CONFIG && window.APP_CONFIG.intro;
-    if (!cfg || cfg.enabled === false) return false;
-    var mode = cfg.mode || "daily";
-    var now  = Date.now();
-    var last = localStorage.getItem("falc_intro_last");
-
-    if (mode === "always") return true;
-
-    if (mode === "once") {
-      if (!localStorage.getItem("falc_intro_seen")) {
-        localStorage.setItem("falc_intro_seen", "1");
-        return true;
-      }
-      return false;
-    }
-
-    if (mode === "daily") {
-      var newDay = !last ||
-        new Date(+last).toDateString() !== new Date(now).toDateString();
-      if (newDay) { localStorage.setItem("falc_intro_last", String(now)); return true; }
-      return false;
-    }
-
-  } catch (e) { console.error("[CONFIG] shouldShowIntro:", e); }
-  return true; /* fail-open */
-};
-
-/* DOM — hide intro on load if gate says no */
-document.addEventListener("DOMContentLoaded", function () {
-  try {
-    var el = document.getElementById("intro");
-    if (el && !window.shouldShowIntro()) el.style.display = "none";
-  } catch (e) { console.error("[CONFIG] DOM control:", e); }
-});
-
-/* Re-evaluate intro whenever remote config updates */
-window.addEventListener("app_config_updated", function () {
-  try {
-    var el = document.getElementById("intro");
-    if (el && !window.shouldShowIntro()) el.style.display = "none";
-  } catch (e) { console.error("[CONFIG] app_config_updated:", e); }
-});
-</script>
-<!-- ════ END CONFIG LAYER ════ -->
-
 </body>
 </html>
